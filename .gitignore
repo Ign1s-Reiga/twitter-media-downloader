@@ -1,0 +1,14 @@
+# Logs
+logs
+*.log
+pnpm-debug.log*
+
+node_modules
+.next
+out
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.idea
