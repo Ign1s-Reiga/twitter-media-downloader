@@ -13,6 +13,10 @@ const DEFAULT_MAX_ITEMS: usize = 100;
 /// Safety cap on page requests regardless of `max_items`.
 const MAX_PAGES: usize = 20;
 
+/// Browser-like UA used when fetching media from Twitter's CDN, which rejects
+/// some requests (notably video.twimg.com) that don't look like a browser.
+const MEDIA_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
 #[derive(Serialize)]
 pub struct MediaResponse {
     items: Vec<MediaItem>,
@@ -150,11 +154,12 @@ async fn download_media(
     let dest = unique_path(&dir, &sanitize_filename(&filename));
 
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0")
+        .user_agent(MEDIA_UA)
         .build()
         .map_err(|e| e.to_string())?;
     let bytes = client
         .get(&url)
+        .header("referer", "https://x.com/")
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -212,10 +217,77 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     dir.join(name)
 }
 
+/// Stream Twitter media through a custom URI scheme so the webview plays it as a
+/// same-origin resource. video.twimg.com returns 403 when the Referer is a
+/// non-Twitter origin — and the webview's `<video>` element sends the app origin
+/// (`http://tauri.localhost`) as Referer, which can't be overridden client-side.
+/// So we fetch server-side with a Twitter Referer, forward the Range header for
+/// seeking, and relay the bytes.
+async fn proxy_media(
+    request: tauri::http::Request<Vec<u8>>,
+) -> Result<tauri::http::Response<Vec<u8>>, String> {
+    let encoded = request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("u="))
+        .ok_or_else(|| "missing url".to_string())?;
+    let target = urlencoding::decode(encoded)
+        .map_err(|e| e.to_string())?
+        .into_owned();
+
+    // Allowlist Twitter media hosts so this can't act as an open proxy / SSRF.
+    const ALLOWED: [&str; 3] = [
+        "https://video.twimg.com/",
+        "https://video-ft.twimg.com/",
+        "https://pbs.twimg.com/",
+    ];
+    if !ALLOWED.iter().any(|p| target.starts_with(p)) {
+        return Err("host not allowed".to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let mut req = client
+        .get(&target)
+        .header("referer", "https://x.com/")
+        .header("user-agent", MEDIA_UA);
+    if let Some(range) = request.headers().get("range").and_then(|v| v.to_str().ok()) {
+        req = req.header("range", range);
+    }
+    let upstream = req.send().await.map_err(|e| e.to_string())?;
+
+    let mut builder = tauri::http::Response::builder().status(upstream.status().as_u16());
+    for name in [
+        "content-type",
+        "content-length",
+        "content-range",
+        "accept-ranges",
+        "cache-control",
+    ] {
+        if let Some(v) = upstream.headers().get(name) {
+            builder = builder.header(name, v.as_bytes());
+        }
+    }
+    let body = upstream.bytes().await.map_err(|e| e.to_string())?.to_vec();
+    builder.body(body).map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .register_asynchronous_uri_scheme_protocol("twmedia", |_ctx, request, responder| {
+            tauri::async_runtime::spawn(async move {
+                let response = proxy_media(request).await.unwrap_or_else(|_| {
+                    tauri::http::Response::builder()
+                        .status(502)
+                        .body(Vec::new())
+                        .unwrap()
+                });
+                responder.respond(response);
+            });
+        })
         .invoke_handler(tauri::generate_handler![
             fetch_user_media,
             list_browsers,

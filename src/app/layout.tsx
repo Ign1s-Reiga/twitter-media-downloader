@@ -2,6 +2,7 @@ import { Geist_Mono, Noto_Sans, Inter } from 'next/font/google';
 
 import './globals.css';
 import { ThemeProvider } from '@/components/theme-provider';
+import { DownloadProvider } from '@/components/download-provider';
 import { Toaster } from '@/components/ui/sonner';
 import { cn } from '@/lib/utils';
 
@@ -23,7 +24,9 @@ export default function RootLayout({ children }: Readonly<{
     >
       <body>
         <ThemeProvider>
-          {children}
+          <DownloadProvider>
+            {children}
+          </DownloadProvider>
           <Toaster />
         </ThemeProvider>
       </body>

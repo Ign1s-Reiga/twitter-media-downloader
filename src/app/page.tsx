@@ -2,7 +2,7 @@
 
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group';
-import { FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon } from 'lucide-react';
+import { DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, ListChecksIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon, XIcon } from 'lucide-react';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
@@ -14,7 +14,10 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
-import { MediaCard, MediaItem } from '@/components/media-card';
+import { MediaCard } from '@/components/media-card';
+import { MediaItem } from '@/lib/media';
+import { Progress } from '@/components/ui/progress';
+import { useDownloads } from '@/components/download-provider';
 
 interface MediaResponse {
   items: MediaItem[];
@@ -40,6 +43,9 @@ export default function Page() {
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const { tasks, enqueue } = useDownloads();
 
   // Detect which browsers we can import the logged-in X account from.
   useEffect(() => {
@@ -57,6 +63,8 @@ export default function Page() {
 
     setLoading(true);
     setSearched(true);
+    setSelectMode(false);
+    setSelected(new Set());
     try {
       const usingBrowser = accountSource !== GUEST && accountSource !== MANUAL;
       const res = await invoke<MediaResponse>('fetch_user_media', {
@@ -85,6 +93,30 @@ export default function Page() {
       retrieve();
     }
   };
+
+  const toggleSelected = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const allSelected = items.length > 0 && selected.size === items.length;
+  const toggleSelectAll = () => {
+    setSelected(allSelected ? new Set() : new Set(items.map((i) => i.id)));
+  };
+
+  const exitSelectMode = () => {
+    setSelectMode(false);
+    setSelected(new Set());
+  };
+
+  const selectedItems = items.filter((i) => selected.has(i.id));
 
   return (
     <div className="grid grid-cols-[1fr_360px] h-svh">
@@ -211,9 +243,22 @@ export default function Page() {
             </div>
           ) : items.length > 0 ? (
             <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
-              {items.map((item) => (
-                <MediaCard key={item.id} item={item} />
-              ))}
+              {items.map((item) =>
+                selectMode ? (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => toggleSelected(item.id)}
+                    aria-pressed={selected.has(item.id)}
+                    title={selected.has(item.id) ? 'Deselect' : 'Select'}
+                    className="block w-full rounded-lg text-left focus-visible:ring-3 focus-visible:ring-ring/30 focus-visible:outline-none"
+                  >
+                    <MediaCard item={item} selectMode selected={selected.has(item.id)} />
+                  </button>
+                ) : (
+                  <MediaCard key={item.id} item={item} />
+                ),
+              )}
             </div>
           ) : (
             <div className="flex h-full min-h-40 items-center justify-center text-center text-muted-foreground">
@@ -223,17 +268,72 @@ export default function Page() {
             </div>
           )}
         </ScrollArea>
-        <Button className="w-full" disabled={items.length === 0}>
-          Download
-        </Button>
+        {selectMode ? (
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={exitSelectMode}>
+              <XIcon className="mr-1" />
+              Cancel
+            </Button>
+            <Button variant="outline" onClick={toggleSelectAll} disabled={items.length === 0}>
+              {allSelected ? 'Clear' : 'Select all'}
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => void enqueue(selectedItems, 'Selected')}
+              disabled={selected.size === 0}
+            >
+              <DownloadIcon className="mr-1" />
+              {`Download selected (${selected.size})`}
+            </Button>
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={() => setSelectMode(true)} disabled={items.length === 0}>
+              <ListChecksIcon className="mr-1" />
+              Select
+            </Button>
+            <Button
+              className="flex-1"
+              onClick={() => void enqueue(items, 'All media')}
+              disabled={items.length === 0}
+            >
+              <DownloadIcon className="mr-1" />
+              {`Download all${items.length > 0 ? ` (${items.length})` : ''}`}
+            </Button>
+          </div>
+        )}
       </div>
       <aside className="border-border border-l flex flex-col h-full">
-        <div className="grow p-4">
+        <div className="grow flex flex-col min-h-0 p-4">
           <h1 className="text-4xl font-extrabold tracking-tight text-balance">
             Tasks
           </h1>
-          <div className="overflow-y-auto">
-
+          <div className="mt-4 grow min-h-0 overflow-y-auto">
+            {tasks.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No downloads yet.</p>
+            ) : (
+              <ul className="space-y-3">
+                {tasks.map((t) => {
+                  const finished = t.done + t.failed;
+                  const pct = t.total > 0 ? (finished / t.total) * 100 : 0;
+                  return (
+                    <li key={t.id} className="rounded-lg border border-border p-3">
+                      <div className="flex items-center justify-between gap-2 text-sm">
+                        <span className="truncate font-medium">{t.label}</span>
+                        <span className="shrink-0 text-xs text-muted-foreground">
+                          {t.status === 'completed'
+                            ? t.failed > 0
+                              ? `${t.done}/${t.total} · ${t.failed} failed`
+                              : 'Done'
+                            : `${finished}/${t.total}`}
+                        </span>
+                      </div>
+                      <Progress value={pct} className="mt-2" />
+                    </li>
+                  );
+                })}
+              </ul>
+            )}
           </div>
         </div>
         <div className="border-t border-border p-4 flex items-center">
