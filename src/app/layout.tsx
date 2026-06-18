@@ -2,6 +2,7 @@ import { Geist_Mono, Noto_Sans, Inter } from 'next/font/google';
 
 import './globals.css';
 import { ThemeProvider } from '@/components/theme-provider';
+import { Toaster } from '@/components/ui/sonner';
 import { cn } from '@/lib/utils';
 
 const interHeading = Inter({subsets:['latin'],variable:'--font-heading'});
@@ -21,7 +22,10 @@ export default function RootLayout({ children }: Readonly<{
       className={cn('antialiased', fontMono.variable, 'font-sans', "font-sans", notoSans.variable, interHeading.variable)}
     >
       <body>
-        <ThemeProvider>{children}</ThemeProvider>
+        <ThemeProvider>
+          {children}
+          <Toaster />
+        </ThemeProvider>
       </body>
     </html>
   );
