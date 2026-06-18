@@ -7,19 +7,21 @@ import { toast } from 'sonner';
 import { Semaphore } from '@/lib/semaphore';
 import { MediaItem, mediaFilename } from '@/lib/media';
 
+export type DownloadStatus = 'pending' | 'downloading' | 'completed' | 'failed';
+
+/** One task card per MediaItem download. */
 export interface DownloadTask {
   id: string;
   label: string;
-  total: number;
-  done: number;
-  failed: number;
-  status: 'running' | 'completed';
+  status: DownloadStatus;
 }
 
 interface DownloadContextValue {
   tasks: DownloadTask[];
-  /** Queue a download order; resolves when the whole order finishes. */
-  enqueue: (items: MediaItem[], label: string) => Promise<void>;
+  /** Queue a download order — one task card per item; resolves when all finish. */
+  enqueue: (items: MediaItem[], orderLabel: string) => Promise<void>;
+  /** Clear the task list (e.g. on a new search). */
+  reset: () => void;
 }
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -36,52 +38,69 @@ function newId(): string {
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
 
-  const enqueue = useCallback(async (items: MediaItem[], label: string) => {
-    if (items.length === 0) return;
-
-    const id = newId();
-    setTasks((prev) => [
-      { id, label, total: items.length, done: 0, failed: 0, status: 'running' },
-      ...prev,
-    ]);
-
-    let done = 0;
-    let failed = 0;
-    let firstPath: string | undefined;
-
-    await Promise.all(
-      items.map((item) =>
-        semaphore.run(async () => {
-          try {
-            const path = await invoke<string>('download_media', {
-              url: item.download_url,
-              filename: mediaFilename(item),
-            });
-            if (!firstPath) firstPath = path;
-            done += 1;
-          } catch {
-            failed += 1;
-          }
-          setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done, failed } : t)));
-        }),
-      ),
-    );
-
-    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status: 'completed' } : t)));
-
-    // A single toast, only once the entire order has finished.
-    const savedPath = firstPath;
-    const action = savedPath
-      ? { label: 'Show', onClick: () => void revealItemInDir(savedPath).catch(() => {}) }
-      : undefined;
-    if (failed === 0) {
-      toast.success(`${label} — downloaded ${done} item${done === 1 ? '' : 's'}.`, { action });
-    } else {
-      toast.warning(`${label} — ${done} done, ${failed} failed.`, { action });
-    }
+  const setStatus = useCallback((id: string, status: DownloadStatus) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)));
   }, []);
 
-  return <DownloadContext.Provider value={{ tasks, enqueue }}>{children}</DownloadContext.Provider>;
+  const reset = useCallback(() => {
+    // Keep still-running downloads visible; only clear finished history. This
+    // way a new search doesn't orphan in-flight downloads (their cards stay,
+    // and their completion toast still lands against a visible task).
+    setTasks((prev) => prev.filter((t) => t.status === 'pending' || t.status === 'downloading'));
+  }, []);
+
+  const enqueue = useCallback(
+    async (items: MediaItem[], orderLabel: string) => {
+      if (items.length === 0) return;
+
+      // Each MediaItem becomes its own task card.
+      const entries = items.map((item) => ({ id: newId(), item, label: mediaFilename(item) }));
+      setTasks((prev) => [
+        ...entries.map((e) => ({ id: e.id, label: e.label, status: 'pending' as DownloadStatus })),
+        ...prev,
+      ]);
+
+      let done = 0;
+      let failed = 0;
+      let firstPath: string | undefined;
+
+      await Promise.all(
+        entries.map((e) =>
+          semaphore.run(async () => {
+            setStatus(e.id, 'downloading');
+            try {
+              const path = await invoke<string>('download_media', {
+                url: e.item.download_url,
+                filename: e.label,
+              });
+              if (!firstPath) firstPath = path;
+              done += 1;
+              setStatus(e.id, 'completed');
+            } catch {
+              failed += 1;
+              setStatus(e.id, 'failed');
+            }
+          }),
+        ),
+      );
+
+      // A single toast, only once the entire order has finished.
+      const savedPath = firstPath;
+      const action = savedPath
+        ? { label: 'Show', onClick: () => void revealItemInDir(savedPath).catch(() => {}) }
+        : undefined;
+      if (failed === 0) {
+        toast.success(`${orderLabel} — downloaded ${done} item${done === 1 ? '' : 's'}.`, { action });
+      } else {
+        toast.warning(`${orderLabel} — ${done} done, ${failed} failed.`, { action });
+      }
+    },
+    [setStatus],
+  );
+
+  return (
+    <DownloadContext.Provider value={{ tasks, enqueue, reset }}>{children}</DownloadContext.Provider>
+  );
 }
 
 export function useDownloads(): DownloadContextValue {

@@ -2,7 +2,7 @@
 
 import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui/field';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group';
-import { DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, ListChecksIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon, XIcon } from 'lucide-react';
+import { CheckIcon, DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, ListChecksIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon, XIcon } from 'lucide-react';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
@@ -16,8 +16,8 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import { MediaCard } from '@/components/media-card';
 import { MediaItem } from '@/lib/media';
-import { Progress } from '@/components/ui/progress';
-import { useDownloads } from '@/components/download-provider';
+import { Spinner } from '@/components/ui/spinner';
+import { useDownloads, type DownloadStatus } from '@/components/download-provider';
 
 interface MediaResponse {
   items: MediaItem[];
@@ -33,6 +33,19 @@ interface BrowserInfo {
 const GUEST = 'guest';
 const MANUAL = 'manual';
 
+function TaskStatusIcon({ status }: { status: DownloadStatus }) {
+  switch (status) {
+    case 'downloading':
+      return <Spinner className="text-primary" />;
+    case 'completed':
+      return <CheckIcon className="size-4 text-primary" />;
+    case 'failed':
+      return <XIcon className="size-4 text-destructive" />;
+    default:
+      return <span className="size-2 rounded-full bg-muted-foreground/40" aria-hidden />;
+  }
+}
+
 export default function Page() {
   const [open, setOpen] = useState(false);
   const [accountUrl, setAccountUrl] = useState('');
@@ -45,7 +58,7 @@ export default function Page() {
   const [searched, setSearched] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const { tasks, enqueue } = useDownloads();
+  const { tasks, enqueue, reset } = useDownloads();
 
   // Detect which browsers we can import the logged-in X account from.
   useEffect(() => {
@@ -74,6 +87,7 @@ export default function Page() {
         sessionToken: accountSource === MANUAL ? sessionToken.trim() || null : null,
       });
       setItems(res.items);
+      reset(); // new results arrived: clear finished task history (keeps any in-flight)
       if (res.items.length === 0) {
         toast.info('No media found for that account with the current filters.');
       } else {
@@ -312,26 +326,20 @@ export default function Page() {
             {tasks.length === 0 ? (
               <p className="text-sm text-muted-foreground">No downloads yet.</p>
             ) : (
-              <ul className="space-y-3">
-                {tasks.map((t) => {
-                  const finished = t.done + t.failed;
-                  const pct = t.total > 0 ? (finished / t.total) * 100 : 0;
-                  return (
-                    <li key={t.id} className="rounded-lg border border-border p-3">
-                      <div className="flex items-center justify-between gap-2 text-sm">
-                        <span className="truncate font-medium">{t.label}</span>
-                        <span className="shrink-0 text-xs text-muted-foreground">
-                          {t.status === 'completed'
-                            ? t.failed > 0
-                              ? `${t.done}/${t.total} · ${t.failed} failed`
-                              : 'Done'
-                            : `${finished}/${t.total}`}
-                        </span>
-                      </div>
-                      <Progress value={pct} className="mt-2" />
-                    </li>
-                  );
-                })}
+              <ul className="space-y-2">
+                {tasks.map((t) => (
+                  <li
+                    key={t.id}
+                    className="flex items-center gap-2 rounded-lg border border-border p-2.5 text-sm"
+                  >
+                    <span className="flex size-4 shrink-0 items-center justify-center">
+                      <TaskStatusIcon status={t.status} />
+                    </span>
+                    <span className="min-w-0 flex-1 truncate" title={t.label}>
+                      {t.label}
+                    </span>
+                  </li>
+                ))}
               </ul>
             )}
           </div>
