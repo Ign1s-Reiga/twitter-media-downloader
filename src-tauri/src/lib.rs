@@ -144,14 +144,20 @@ async fn download_media(
     app: tauri::AppHandle,
     url: String,
     filename: String,
+    dir: Option<String>,
 ) -> Result<String, String> {
     use tauri::Manager;
 
-    let dir = app
-        .path()
-        .download_dir()
-        .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?;
-    let dest = unique_path(&dir, &sanitize_filename(&filename));
+    // Save into the user-specified folder when given, else the OS Downloads dir.
+    let base = match dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => std::path::PathBuf::from(d),
+        None => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
+    };
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+    let dest = unique_path(&base, &sanitize_filename(&filename));
 
     let client = reqwest::Client::builder()
         .user_agent(MEDIA_UA)
@@ -277,6 +283,7 @@ async fn proxy_media(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .register_asynchronous_uri_scheme_protocol("twmedia", |_ctx, request, responder| {
             tauri::async_runtime::spawn(async move {
                 let response = proxy_media(request).await.unwrap_or_else(|_| {

@@ -8,6 +8,7 @@ import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
 import { useEffect, useState, KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Button } from '@/components/ui/button';
@@ -58,7 +59,7 @@ export default function Page() {
   const [searched, setSearched] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const { tasks, enqueue, reset } = useDownloads();
+  const { tasks, enqueue, reset, downloadDir, setDownloadDir } = useDownloads();
 
   // Detect which browsers we can import the logged-in X account from.
   useEffect(() => {
@@ -128,6 +129,13 @@ export default function Page() {
   const exitSelectMode = () => {
     setSelectMode(false);
     setSelected(new Set());
+  };
+
+  const pickDir = async () => {
+    const dir = await openDialog({ directory: true, multiple: false, title: 'Select download folder' });
+    if (typeof dir === 'string') {
+      setDownloadDir(dir);
+    }
   };
 
   const selectedItems = items.filter((i) => selected.has(i.id));
@@ -215,12 +223,23 @@ export default function Page() {
                   <Field>
                     <FieldLabel htmlFor="download-location">Download Location</FieldLabel>
                     <InputGroup id="download-location">
-                      <InputGroupInput placeholder="Select download location..." />
-                      <InputGroupButton>
+                      <InputGroupInput
+                        placeholder="Default: Downloads folder"
+                        value={downloadDir ?? ''}
+                        title={downloadDir ?? 'Default: Downloads folder'}
+                        readOnly
+                        onClick={pickDir}
+                      />
+                      {downloadDir && (
+                        <InputGroupButton onClick={() => setDownloadDir(null)} aria-label="Reset to Downloads folder">
+                          <XIcon />
+                        </InputGroupButton>
+                      )}
+                      <InputGroupButton onClick={pickDir} aria-label="Choose download folder">
                         <FolderIcon />
                       </InputGroupButton>
                     </InputGroup>
-                    <FieldDescription>The location where you want to save the downloaded media.</FieldDescription>
+                    <FieldDescription>Where downloaded media is saved. Defaults to your Downloads folder.</FieldDescription>
                   </Field>
                   {accountSource === MANUAL && (
                     <Field className="col-span-2">

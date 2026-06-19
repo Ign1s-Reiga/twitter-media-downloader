@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useCallback, useContext, useState } from 'react';
+import { createContext, useCallback, useContext, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { toast } from 'sonner';
@@ -22,6 +22,9 @@ interface DownloadContextValue {
   enqueue: (items: MediaItem[], orderLabel: string) => Promise<void>;
   /** Clear the task list (e.g. on a new search). */
   reset: () => void;
+  /** Folder downloads are saved to; null means the OS Downloads folder. */
+  downloadDir: string | null;
+  setDownloadDir: (dir: string | null) => void;
 }
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -37,6 +40,15 @@ function newId(): string {
 
 export function DownloadProvider({ children }: { children: React.ReactNode }) {
   const [tasks, setTasks] = useState<DownloadTask[]>([]);
+
+  // Mirror the chosen dir into a ref so enqueue reads the latest without being
+  // re-created (and so concurrent downloads all use the current folder).
+  const [downloadDir, setDownloadDirState] = useState<string | null>(null);
+  const dirRef = useRef<string | null>(null);
+  const setDownloadDir = useCallback((dir: string | null) => {
+    dirRef.current = dir;
+    setDownloadDirState(dir);
+  }, []);
 
   const setStatus = useCallback((id: string, status: DownloadStatus) => {
     setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)));
@@ -72,6 +84,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               const path = await invoke<string>('download_media', {
                 url: e.item.download_url,
                 filename: e.label,
+                dir: dirRef.current,
               });
               if (!firstPath) firstPath = path;
               done += 1;
@@ -99,7 +112,9 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <DownloadContext.Provider value={{ tasks, enqueue, reset }}>{children}</DownloadContext.Provider>
+    <DownloadContext.Provider value={{ tasks, enqueue, reset, downloadDir, setDownloadDir }}>
+      {children}
+    </DownloadContext.Provider>
   );
 }
 
