@@ -6,7 +6,7 @@ import { CheckIcon, DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
 import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
-import { useEffect, useState, KeyboardEvent } from 'react';
+import { useEffect, useRef, useState, KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
@@ -60,6 +60,13 @@ export default function Page() {
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const { tasks, enqueue, reset, downloadDir, setDownloadDir } = useDownloads();
+  const resultsRef = useRef<HTMLDivElement>(null);
+
+  const scrollResultsToTop = () => {
+    resultsRef.current
+      ?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')
+      ?.scrollTo({ top: 0 });
+  };
 
   // Detect which browsers we can import the logged-in X account from.
   useEffect(() => {
@@ -79,6 +86,7 @@ export default function Page() {
     setSearched(true);
     setSelectMode(false);
     setSelected(new Set());
+    scrollResultsToTop(); // start a new search from the top of the results
     try {
       const usingBrowser = accountSource !== GUEST && accountSource !== MANUAL;
       const res = await invoke<MediaResponse>('fetch_user_media', {
@@ -142,7 +150,7 @@ export default function Page() {
 
   return (
     <div className="grid grid-cols-[1fr_360px] h-svh">
-      <div className="flex w-full h-full flex-col gap-4 p-6 text-sm leading-loose">
+      <div className="flex w-full h-full min-h-0 flex-col gap-4 p-6 text-sm leading-loose">
         <Card className="w-full">
           <CardHeader>
             <CardTitle>X/Twitter Media Downloader</CardTitle>
@@ -267,7 +275,7 @@ export default function Page() {
             </Collapsible>
           </CardContent>
         </Card>
-        <ScrollArea className="grow h-0 pr-2">
+        <ScrollArea ref={resultsRef} className="grow h-0 pr-2">
           {loading ? (
             <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
               {[...Array(12)].map((_, i) => (
@@ -336,12 +344,12 @@ export default function Page() {
           </div>
         )}
       </div>
-      <aside className="border-border border-l flex flex-col h-full">
+      <aside className="border-border border-l flex flex-col h-full min-h-0">
         <div className="grow flex flex-col min-h-0 p-4">
           <h1 className="text-4xl font-extrabold tracking-tight text-balance">
             Tasks
           </h1>
-          <div className="mt-4 grow min-h-0 overflow-y-auto">
+          <ScrollArea className="mt-4 grow h-0 pr-2">
             {tasks.length === 0 ? (
               <p className="text-sm text-muted-foreground">No downloads yet.</p>
             ) : (
@@ -361,7 +369,7 @@ export default function Page() {
                 ))}
               </ul>
             )}
-          </div>
+          </ScrollArea>
         </div>
         <div className="border-t border-border p-4 flex items-center">
           <ToggleThemeButton />

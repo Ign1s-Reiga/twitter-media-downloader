@@ -148,15 +148,19 @@ async fn download_media(
 ) -> Result<String, String> {
     use tauri::Manager;
 
-    // Save into the user-specified folder when given, else the OS Downloads dir.
+    // Save into the user-specified folder when given (creating it if needed),
+    // else the OS Downloads dir (which always exists).
     let base = match dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => std::path::PathBuf::from(d),
+        Some(d) => {
+            let p = std::path::PathBuf::from(d);
+            std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+            p
+        }
         None => app
             .path()
             .download_dir()
             .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
     };
-    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     let dest = unique_path(&base, &sanitize_filename(&filename));
 
     let client = reqwest::Client::builder()
@@ -175,7 +179,12 @@ async fn download_media(
         .await
         .map_err(|e| e.to_string())?;
 
-    std::fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    // Writing a potentially-large file is blocking; keep it off the async runtime.
+    let write_dest = dest.clone();
+    tauri::async_runtime::spawn_blocking(move || std::fs::write(&write_dest, &bytes))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     Ok(dest.to_string_lossy().into_owned())
 }
 

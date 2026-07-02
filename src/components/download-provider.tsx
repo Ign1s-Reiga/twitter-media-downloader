@@ -65,6 +65,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     async (items: MediaItem[], orderLabel: string) => {
       if (items.length === 0) return;
 
+      // Capture the folder once so the whole order goes to one destination, even
+      // if the user changes it mid-download.
+      const dir = dirRef.current;
+
       // Each MediaItem becomes its own task card.
       const entries = items.map((item) => ({ id: newId(), item, label: mediaFilename(item) }));
       setTasks((prev) => [
@@ -75,6 +79,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       let done = 0;
       let failed = 0;
       let firstPath: string | undefined;
+      let firstError: string | undefined;
 
       await Promise.all(
         entries.map((e) =>
@@ -84,13 +89,14 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               const path = await invoke<string>('download_media', {
                 url: e.item.download_url,
                 filename: e.label,
-                dir: dirRef.current,
+                dir,
               });
               if (!firstPath) firstPath = path;
               done += 1;
               setStatus(e.id, 'completed');
-            } catch {
+            } catch (err) {
               failed += 1;
+              if (!firstError) firstError = typeof err === 'string' ? err : String(err);
               setStatus(e.id, 'failed');
             }
           }),
@@ -105,7 +111,10 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
       if (failed === 0) {
         toast.success(`${orderLabel} — downloaded ${done} item${done === 1 ? '' : 's'}.`, { action });
       } else {
-        toast.warning(`${orderLabel} — ${done} done, ${failed} failed.`, { action });
+        toast.warning(`${orderLabel} — ${done} done, ${failed} failed.`, {
+          description: firstError,
+          action,
+        });
       }
     },
     [setStatus],
