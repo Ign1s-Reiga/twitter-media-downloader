@@ -88,6 +88,13 @@ pub const X: SiteCookies = SiteCookies {
     hosts: &["%x.com", "%twitter.com"],
 };
 
+pub const INSTAGRAM: SiteCookies = SiteCookies {
+    label: "Instagram",
+    primary: "sessionid",
+    extras: &["csrftoken", "ds_user_id"],
+    hosts: &["%instagram.com"],
+};
+
 /// Credentials lifted from a browser, ready to hand to a scraper.
 pub struct ImportedSession {
     /// `(name, value)` pairs; the site's primary cookie is always among them.

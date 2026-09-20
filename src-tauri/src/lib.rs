@@ -1,13 +1,15 @@
 mod cookies;
+mod instagram;
 mod media;
 mod twitter;
 
 use cookies::BrowserInfo;
+use instagram::InstagramScraper;
+use media::{MediaItem, MediaPage};
 use serde::Serialize;
-use media::MediaItem;
 use twitter::TwitterScraper;
 
-/// How many media items per page request to X.
+/// How many media items per page request to the platform.
 const PAGE_SIZE: u32 = 20;
 /// Default ceiling on items returned in a single `fetch_user_media` call, so a
 /// prolific account doesn't spin forever.
@@ -15,9 +17,110 @@ const DEFAULT_MAX_ITEMS: usize = 100;
 /// Safety cap on page requests regardless of `max_items`.
 const MAX_PAGES: usize = 20;
 
-/// Browser-like UA used when fetching media from Twitter's CDN, which rejects
-/// some requests (notably video.twimg.com) that don't look like a browser.
+/// Browser-like UA used when fetching media from a platform's CDN, which may
+/// reject requests (notably video.twimg.com) that don't look like a browser.
 const MEDIA_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+/// Media CDNs we'll fetch from, and the Referer each one expects. Doubles as
+/// the allowlist for `proxy_media` / `download_media` so neither can be turned
+/// into an open proxy / SSRF. Hosts match exactly or as a subdomain, since
+/// Instagram's CDN spreads across `scontent-*.cdninstagram.com` and
+/// `*.fbcdn.net`.
+const MEDIA_CDNS: [(&str, &str); 3] = [
+    ("twimg.com", "https://x.com/"),
+    ("cdninstagram.com", "https://www.instagram.com/"),
+    ("fbcdn.net", "https://www.instagram.com/"),
+];
+
+/// The Referer to send for a media URL, or `None` if its host isn't an
+/// allowlisted CDN (or the URL isn't https).
+fn cdn_referer(url: &str) -> Option<&'static str> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    MEDIA_CDNS
+        .iter()
+        .find(|(cdn, _)| host == *cdn || host.ends_with(&format!(".{cdn}")))
+        .map(|(_, referer)| *referer)
+}
+
+/// Which site to scrape.
+#[derive(Clone, Copy)]
+enum Platform {
+    X,
+    Instagram,
+}
+
+impl Platform {
+    /// `"x"` (also `"twitter"`) or `"instagram"`; absent means X, which is
+    /// what the app did before it grew a second platform.
+    fn parse(id: Option<&str>) -> Result<Self, String> {
+        match id.map(str::trim).filter(|p| !p.is_empty()) {
+            None | Some("x") | Some("twitter") => Ok(Self::X),
+            Some("instagram") => Ok(Self::Instagram),
+            Some(other) => Err(format!("unknown platform: {other}")),
+        }
+    }
+
+    fn cookie_site(self) -> &'static cookies::SiteCookies {
+        match self {
+            Self::X => &cookies::X,
+            Self::Instagram => &cookies::INSTAGRAM,
+        }
+    }
+}
+
+/// One scraper per platform, behind a common surface for the paging loop.
+enum Scraper {
+    X(TwitterScraper),
+    Instagram(InstagramScraper),
+}
+
+impl Scraper {
+    fn new(platform: Platform, session: Option<&str>) -> Result<Self, String> {
+        Ok(match platform {
+            Platform::X => Self::X(TwitterScraper::new(session).map_err(|e| e.to_string())?),
+            Platform::Instagram => {
+                Self::Instagram(InstagramScraper::new(session).map_err(|e| e.to_string())?)
+            }
+        })
+    }
+
+    /// Pull the account's username out of the pasted URL / handle.
+    fn extract_username(platform: Platform, input: &str) -> Result<String, String> {
+        match platform {
+            Platform::X => twitter::extract_screen_name(input).map_err(|e| e.to_string()),
+            Platform::Instagram => instagram::extract_username(input).map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn get_user_id(&mut self, username: &str) -> Result<String, String> {
+        match self {
+            Self::X(s) => s.get_user_id(username).await.map_err(|e| e.to_string()),
+            Self::Instagram(s) => s.get_user_id(username).await.map_err(|e| e.to_string()),
+        }
+    }
+
+    async fn fetch_media_page(
+        &mut self,
+        user_id: &str,
+        cursor: Option<&str>,
+        count: u32,
+    ) -> Result<MediaPage, String> {
+        match self {
+            Self::X(s) => s
+                .fetch_media_page(user_id, cursor, count)
+                .await
+                .map_err(|e| e.to_string()),
+            Self::Instagram(s) => s
+                .fetch_media_page(user_id, cursor, count)
+                .await
+                .map_err(|e| e.to_string()),
+        }
+    }
+}
 
 #[derive(Serialize)]
 pub struct MediaResponse {
@@ -26,7 +129,7 @@ pub struct MediaResponse {
     next_cursor: Option<String>,
 }
 
-/// List the browsers installed on this machine that we can import X cookies from.
+/// List the browsers installed on this machine that we can import cookies from.
 #[tauri::command]
 fn list_browsers() -> Vec<BrowserInfo> {
     cookies::list_installed()
@@ -34,22 +137,26 @@ fn list_browsers() -> Vec<BrowserInfo> {
 
 /// Scrape a user's media timeline.
 ///
+/// * `platform` — `"x"` or `"instagram"` (defaults to X).
 /// * `account_url` — profile URL, `@handle`, or bare handle.
 /// * `filters` — any of `"images"` / `"videos"`; empty/None means no filtering.
 /// * `browser` — a browser id (`chrome`/`edge`/`brave`/`firefox`) to import the
 ///   logged-in account's cookies from. Takes precedence over `session_token`.
-/// * `session_token` — optional `auth_token` (or full cookie string) for
-///   authenticated access; falls back to guest mode when absent.
+/// * `session_token` — optional login cookie (`auth_token` for X, `sessionid`
+///   for Instagram — or a full cookie string) for authenticated access; falls
+///   back to guest mode when absent.
 /// * `max_items` — soft cap on items to return (defaults to 100).
 #[tauri::command]
 async fn fetch_user_media(
+    platform: Option<String>,
     account_url: String,
     filters: Option<Vec<String>>,
     browser: Option<String>,
     session_token: Option<String>,
     max_items: Option<usize>,
 ) -> Result<MediaResponse, String> {
-    let screen_name = twitter::extract_screen_name(&account_url).map_err(|e| e.to_string())?;
+    let platform = Platform::parse(platform.as_deref())?;
+    let username = Scraper::extract_username(platform, &account_url)?;
     let cap = max_items.unwrap_or(DEFAULT_MAX_ITEMS).max(1);
     let wants = MediaFilter::from(filters.as_deref());
 
@@ -59,7 +166,8 @@ async fn fetch_user_media(
     let session = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
         Some(id) => {
             let id = id.to_string();
-            let imported = tauri::async_runtime::spawn_blocking(move || cookies::import(&id, &cookies::X))
+            let site = platform.cookie_site();
+            let imported = tauri::async_runtime::spawn_blocking(move || cookies::import(&id, site))
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
@@ -68,8 +176,8 @@ async fn fetch_user_media(
         None => session_token.filter(|s| !s.trim().is_empty()),
     };
 
-    let mut scraper = TwitterScraper::new(session.as_deref()).map_err(|e| e.to_string())?;
-    let user_id = scraper.get_user_id(&screen_name).await.map_err(|e| e.to_string())?;
+    let mut scraper = Scraper::new(platform, session.as_deref())?;
+    let user_id = scraper.get_user_id(&username).await?;
 
     let mut items: Vec<MediaItem> = Vec::new();
     let mut cursor: Option<String> = None;
@@ -78,8 +186,7 @@ async fn fetch_user_media(
     for _ in 0..MAX_PAGES {
         let page = scraper
             .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE)
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
 
         let page_cursor = page.next_cursor.clone();
         for item in page.items {
@@ -97,8 +204,9 @@ async fn fetch_user_media(
         }
 
         // Follow the cursor even on a page that yielded no media (X returns
-        // cursor-only / interstitial pages). Stop when there's no cursor or it
-        // stops advancing (X echoes the same bottom cursor at the end).
+        // cursor-only / interstitial pages; Instagram pages can be all
+        // filtered out). Stop when there's no cursor or it stops advancing (X
+        // echoes the same bottom cursor at the end).
         match page_cursor {
             Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
             _ => {
@@ -150,6 +258,8 @@ async fn download_media(
 ) -> Result<String, String> {
     use tauri::Manager;
 
+    let referer = cdn_referer(&url).ok_or_else(|| "host not allowed".to_string())?;
+
     // Save into the user-specified folder when given (creating it if needed),
     // else the OS Downloads dir (which always exists).
     let base = match dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
@@ -171,7 +281,7 @@ async fn download_media(
         .map_err(|e| e.to_string())?;
     let bytes = client
         .get(&url)
-        .header("referer", "https://x.com/")
+        .header("referer", referer)
         .send()
         .await
         .map_err(|e| e.to_string())?
@@ -234,12 +344,12 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
     dir.join(name)
 }
 
-/// Stream Twitter media through a custom URI scheme so the webview plays it as a
-/// same-origin resource. video.twimg.com returns 403 when the Referer is a
+/// Stream platform media through a custom URI scheme so the webview plays it as
+/// a same-origin resource. video.twimg.com returns 403 when the Referer is a
 /// non-Twitter origin — and the webview's `<video>` element sends the app origin
 /// (`http://tauri.localhost`) as Referer, which can't be overridden client-side.
-/// So we fetch server-side with a Twitter Referer, forward the Range header for
-/// seeking, and relay the bytes.
+/// So we fetch server-side with the CDN's own Referer, forward the Range header
+/// for seeking, and relay the bytes.
 async fn proxy_media(
     request: tauri::http::Request<Vec<u8>>,
 ) -> Result<tauri::http::Response<Vec<u8>>, String> {
@@ -254,20 +364,13 @@ async fn proxy_media(
         .map_err(|e| e.to_string())?
         .into_owned();
 
-    // Allowlist Twitter media hosts so this can't act as an open proxy / SSRF.
-    const ALLOWED: [&str; 3] = [
-        "https://video.twimg.com/",
-        "https://video-ft.twimg.com/",
-        "https://pbs.twimg.com/",
-    ];
-    if !ALLOWED.iter().any(|p| target.starts_with(p)) {
-        return Err("host not allowed".to_string());
-    }
+    // Only known media CDNs, so this can't act as an open proxy / SSRF.
+    let referer = cdn_referer(&target).ok_or_else(|| "host not allowed".to_string())?;
 
     let client = reqwest::Client::new();
     let mut req = client
         .get(&target)
-        .header("referer", "https://x.com/")
+        .header("referer", referer)
         .header("user-agent", MEDIA_UA);
     if let Some(range) = request.headers().get("range").and_then(|v| v.to_str().ok()) {
         req = req.header("range", range);
@@ -313,4 +416,37 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+#[cfg(test)]
+mod tests {
+    use super::cdn_referer;
+
+    #[test]
+    fn cdn_referer_allows_known_media_hosts() {
+        assert_eq!(cdn_referer("https://pbs.twimg.com/media/a.jpg?name=orig"), Some("https://x.com/"));
+        assert_eq!(cdn_referer("https://video.twimg.com/ext_tw_video/1/pu/vid/a.mp4"), Some("https://x.com/"));
+        assert_eq!(
+            cdn_referer("https://scontent-nrt1-1.cdninstagram.com/v/t51/a.jpg?oh=1&oe=2"),
+            Some("https://www.instagram.com/")
+        );
+        assert_eq!(
+            cdn_referer("https://instagram.fnrt1-1.fna.fbcdn.net/v/a.mp4"),
+            Some("https://www.instagram.com/")
+        );
+    }
+
+    #[test]
+    fn cdn_referer_rejects_everything_else() {
+        for url in [
+            "http://pbs.twimg.com/media/a.jpg",       // plain http
+            "https://twimg.com.evil.example/a.jpg",   // suffix spoof
+            "https://evil.example/?u=pbs.twimg.com",  // host in query only
+            "https://notfbcdn.net/a.mp4",             // shares a suffix, not a subdomain
+            "https://127.0.0.1/admin",
+            "file:///C:/Windows/win.ini",
+            "not a url",
+        ] {
+            assert_eq!(cdn_referer(url), None, "{url}");
+        }
+    }
 }

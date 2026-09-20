@@ -12,11 +12,13 @@ import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Card, CardAction, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import { MediaCard } from '@/components/media-card';
 import { MediaItem } from '@/lib/media';
+import { PLATFORMS, platformInfo, type Platform } from '@/lib/platform';
+import { PLATFORM_ICONS } from '@/components/platform-icons';
 import { Spinner } from '@/components/ui/spinner';
 import { useDownloads, type DownloadStatus } from '@/components/download-provider';
 
@@ -49,9 +51,12 @@ function TaskStatusIcon({ status }: { status: DownloadStatus }) {
 
 export default function Page() {
   const [open, setOpen] = useState(false);
+  const [platform, setPlatform] = useState<Platform>('x');
   const [accountUrl, setAccountUrl] = useState('');
   const [filters, setFilters] = useState<string[]>([]);
-  const [sessionToken, setSessionToken] = useState('');
+  // One pasted token per platform, so switching sites doesn't send an X
+  // auth_token to Instagram (or vice versa).
+  const [sessionTokens, setSessionTokens] = useState<Record<Platform, string>>({ x: '', instagram: '' });
   const [accountSource, setAccountSource] = useState(GUEST);
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
   const [items, setItems] = useState<MediaItem[]>([]);
@@ -62,13 +67,17 @@ export default function Page() {
   const { tasks, enqueue, reset, downloadDir, setDownloadDir } = useDownloads();
   const resultsRef = useRef<HTMLDivElement>(null);
 
+  const info = platformInfo(platform);
+  const sessionToken = sessionTokens[platform];
+  const setSessionToken = (value: string) => setSessionTokens((prev) => ({ ...prev, [platform]: value }));
+
   const scrollResultsToTop = () => {
     resultsRef.current
       ?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')
       ?.scrollTo({ top: 0 });
   };
 
-  // Detect which browsers we can import the logged-in X account from.
+  // Detect which browsers we can import the logged-in account from.
   useEffect(() => {
     invoke<BrowserInfo[]>('list_browsers')
       .then(setBrowsers)
@@ -78,7 +87,7 @@ export default function Page() {
   const retrieve = async () => {
     if (loading) return;
     if (!accountUrl.trim()) {
-      toast.warning('Enter an X/Twitter account URL or @handle first.');
+      toast.warning(`Enter an ${info.label} account URL or @handle first.`);
       return;
     }
 
@@ -90,6 +99,7 @@ export default function Page() {
     try {
       const usingBrowser = accountSource !== GUEST && accountSource !== MANUAL;
       const res = await invoke<MediaResponse>('fetch_user_media', {
+        platform,
         accountUrl,
         filters,
         browser: usingBrowser ? accountSource : null,
@@ -153,7 +163,27 @@ export default function Page() {
       <div className="flex w-full h-full min-h-0 flex-col gap-4 p-6 text-sm leading-loose">
         <Card className="w-full">
           <CardHeader>
-            <CardTitle>X/Twitter Media Downloader</CardTitle>
+            <CardTitle>Media Downloader</CardTitle>
+            <CardAction>
+              <ToggleGroup
+                type="single"
+                variant="outline"
+                aria-label="Platform"
+                value={platform}
+                onValueChange={(v) => v && setPlatform(v as Platform)}
+                disabled={loading}
+              >
+                {PLATFORMS.map((p) => {
+                  const Icon = PLATFORM_ICONS[p.id];
+                  return (
+                    <ToggleGroupItem key={p.id} value={p.id} aria-label={p.label}>
+                      <Icon className="mr-1" />
+                      {p.label}
+                    </ToggleGroupItem>
+                  );
+                })}
+              </ToggleGroup>
+            </CardAction>
           </CardHeader>
           <CardContent>
             <Collapsible open={open} onOpenChange={setOpen} className="flex items-start gap-2">
@@ -162,7 +192,7 @@ export default function Page() {
                   <FieldLabel htmlFor="account-url">Account URL</FieldLabel>
                   <InputGroup id="account-url">
                     <InputGroupInput
-                      placeholder="Retrive..."
+                      placeholder={info.placeholder}
                       value={accountUrl}
                       onChange={(e) => setAccountUrl(e.target.value)}
                       onKeyDown={onAccountKeyDown}
@@ -175,7 +205,7 @@ export default function Page() {
                       <Kbd>Enter</Kbd>
                     </InputGroupAddon>
                   </InputGroup>
-                  <FieldDescription>The URL of the X/Twitter account you want to get posts from.</FieldDescription>
+                  <FieldDescription>The URL of the {info.label} account you want to get posts from.</FieldDescription>
                 </Field>
                 <CollapsibleContent className="grid grid-cols-2 gap-x-2 gap-y-4">
                   <Field className="col-span-2">
@@ -204,7 +234,7 @@ export default function Page() {
                       </ToggleGroupItem>
                     </ToggleGroup>
                     <FieldDescription>
-                      Import the logged-in account from a browser, or paste a token manually. Guest mode works only for public accounts and is heavily rate-limited by X.
+                      Import the logged-in account from a browser, or paste a token manually. {info.guestNote}
                     </FieldDescription>
                   </Field>
                   <Field>
@@ -254,14 +284,14 @@ export default function Page() {
                       <FieldLabel htmlFor="session-token">Session Token</FieldLabel>
                       <InputGroup id="session-token">
                         <InputGroupInput
-                          placeholder="auth_token value, or auth_token=…; ct0=…"
+                          placeholder={`${info.tokenCookie} value, or ${info.tokenCookie}=…; ${info.extraCookie}=…`}
                           type="password"
                           value={sessionToken}
                           onChange={(e) => setSessionToken(e.target.value)}
                         />
                       </InputGroup>
                       <FieldDescription>
-                        Paste your X <code>auth_token</code> cookie (optionally with <code>ct0</code>). Used to scrape as your account when browser import isn't available.
+                        Paste your {info.label} <code>{info.tokenCookie}</code> cookie (optionally with <code>{info.extraCookie}</code>). Used to scrape as your account when browser import isn't available.
                       </FieldDescription>
                     </Field>
                   )}

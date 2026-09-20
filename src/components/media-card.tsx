@@ -19,17 +19,23 @@ import { cn } from '@/lib/utils';
 import { MediaItem } from '@/lib/media';
 import { useDownloads } from '@/components/download-provider';
 
-/** Append X's image size hint to a pbs.twimg.com URL for lighter previews. */
+/**
+ * Append X's image size hint to a pbs.twimg.com URL for lighter previews. Other
+ * CDNs are left alone: Instagram's URLs are signed, and the scraper already
+ * picks a grid-sized rendition for them.
+ */
 function sized(url: string, name: 'small' | 'medium' | 'large') {
+  if (!url.includes('pbs.twimg.com/')) return url;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}name=${name}`;
 }
 
 /**
- * Route video through the Rust `twmedia` proxy so the webview can play it: the
- * CDN (video.twimg.com) refuses cross-origin requests that lack a Referer, which
- * a `<video>` element can't set. The proxy fetches it server-side and streams it
- * back same-origin. (Custom protocols are served at `http://<scheme>.localhost`.)
+ * Route video through the Rust `twmedia` proxy so the webview can play it: some
+ * CDNs (video.twimg.com) refuse cross-origin requests that lack their Referer,
+ * which a `<video>` element can't set. The proxy fetches it server-side and
+ * streams it back same-origin. (Custom protocols are served at
+ * `http://<scheme>.localhost`.)
  */
 function proxied(url: string) {
   return `http://twmedia.localhost/?u=${encodeURIComponent(url)}`;
