@@ -62,11 +62,11 @@ export function MediaCard({
 
   const copyLink = async () => {
     try {
-      await navigator.clipboard.writeText(item.tweet_url);
+      await navigator.clipboard.writeText(item.post_url);
       toast.success('Post link copied to clipboard.');
     } catch {
       // Clipboard API can be unavailable; show the link so it can be copied by hand.
-      toast.info('Copy this link', { description: item.tweet_url });
+      toast.info('Copy this link', { description: item.post_url });
     }
   };
 
@@ -162,7 +162,7 @@ export function MediaCard({
             Copy link
           </Button>
           <div className="flex gap-2">
-            <Button variant="outline" onClick={() => void openUrl(item.tweet_url)}>
+            <Button variant="outline" onClick={() => void openUrl(item.post_url)}>
               <ExternalLinkIcon className="mr-1" />
               Open post
             </Button>

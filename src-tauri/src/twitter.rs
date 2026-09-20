@@ -15,8 +15,9 @@
 //! query-id path segment plus the `features` query param.
 
 use rand::Rng;
-use serde::Serialize;
 use serde_json::{json, Value};
+
+use crate::media::{MediaItem, MediaPage};
 
 /// Public Bearer token shipped in the X web bundle (not a secret).
 const BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
@@ -43,30 +44,6 @@ pub enum ScrapeError {
     Api(String),
     #[error("could not parse X's response (the GraphQL schema may have changed)")]
     Parse,
-}
-
-/// A single media attachment ready for the frontend to preview / download.
-#[derive(Debug, Serialize)]
-pub struct MediaItem {
-    /// Stable media key from X (used as a React key / dedupe key).
-    pub id: String,
-    pub tweet_id: String,
-    /// "photo" | "video" | "animated_gif".
-    pub media_type: String,
-    /// Smaller URL suitable for grid previews.
-    pub thumbnail_url: String,
-    /// Full-resolution image, or the best video/gif variant to download.
-    pub download_url: String,
-    pub tweet_url: String,
-    pub width: u64,
-    pub height: u64,
-}
-
-/// One page of results plus the cursor to fetch the next page.
-#[derive(Debug, Serialize)]
-pub struct MediaPage {
-    pub items: Vec<MediaItem>,
-    pub next_cursor: Option<String>,
 }
 
 /// Pull a bare screen name out of whatever the user pasted: a full profile URL,
@@ -459,11 +436,11 @@ fn build_media_item(m: &Value, tweet_id: &str, tweet_url: &str) -> Option<MediaI
 
     Some(MediaItem {
         id,
-        tweet_id: tweet_id.to_string(),
+        post_id: tweet_id.to_string(),
         media_type,
         thumbnail_url: thumb,
         download_url,
-        tweet_url: tweet_url.to_string(),
+        post_url: tweet_url.to_string(),
         width,
         height,
     })

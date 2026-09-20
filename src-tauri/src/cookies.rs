@@ -1,5 +1,5 @@
-//! Import X (Twitter) auth cookies from the user's installed browsers, so the
-//! scraper can act as their real logged-in account without them pasting tokens.
+//! Import a site's auth cookies from the user's installed browsers, so a
+//! scraper can act as the real logged-in account without pasted tokens.
 //!
 //! * Chromium family (Chrome / Edge / Brave): cookies live in a SQLite DB with
 //!   AES-256-GCM encrypted values. The AES key is stored in `Local State`,
@@ -8,8 +8,10 @@
 //!   the user fall back to a manual token or a different browser.
 //! * Firefox: cookies are stored unencrypted in `cookies.sqlite`.
 //!
-//! We only ever read `auth_token` and `ct0` for x.com / twitter.com.
+//! We only ever read the handful of cookies a `SiteCookies` spec names, for
+//! that site's hosts.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -19,8 +21,8 @@ use serde::Serialize;
 pub enum CookieError {
     #[error("{0} is not installed (no profile folder found)")]
     NotInstalled(String),
-    #[error("no X/Twitter login found in {0} — make sure you're logged into x.com there")]
-    NoCookies(String),
+    #[error("no {site} login found in {browser} — make sure you're logged into {site} there")]
+    NoCookies { browser: String, site: &'static str },
     #[error("couldn't read {0}'s cookie database: {1}")]
     Db(String, String),
     #[error("couldn't decrypt {0}'s cookies — recent Chrome app-bound encryption isn't supported; try another browser or paste a token manually")]
@@ -61,20 +63,63 @@ pub struct BrowserInfo {
     pub label: String,
 }
 
-/// Credentials lifted from a browser, ready to hand to the scraper.
+/// Which cookies make up a login on a given site.
+pub struct SiteCookies {
+    /// Human-readable site name for error messages.
+    pub label: &'static str,
+    /// The login cookie a session can't work without.
+    pub primary: &'static str,
+    /// Cookies worth carrying alongside it when present (CSRF tokens etc.).
+    pub extras: &'static [&'static str],
+    /// SQL `LIKE` patterns matched against the cookie's host.
+    pub hosts: &'static [&'static str],
+}
+
+impl SiteCookies {
+    fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
+        std::iter::once(self.primary).chain(self.extras.iter().copied())
+    }
+}
+
+pub const X: SiteCookies = SiteCookies {
+    label: "X/Twitter",
+    primary: "auth_token",
+    extras: &["ct0"],
+    hosts: &["%x.com", "%twitter.com"],
+};
+
+/// Credentials lifted from a browser, ready to hand to a scraper.
 pub struct ImportedSession {
-    pub auth_token: String,
-    pub ct0: Option<String>,
+    /// `(name, value)` pairs; the site's primary cookie is always among them.
+    cookies: Vec<(String, String)>,
 }
 
 impl ImportedSession {
-    /// Format as the `auth_token=…; ct0=…` cookie string the scraper parses.
+    /// Format as the `name=value; name=value` cookie string the scrapers parse.
     pub fn as_cookie_string(&self) -> String {
-        match &self.ct0 {
-            Some(ct0) => format!("auth_token={}; ct0={}", self.auth_token, ct0),
-            None => format!("auth_token={}", self.auth_token),
-        }
+        self.cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
     }
+
+    /// Every cookie the site spec asked for was found.
+    fn is_complete(&self, site: &SiteCookies) -> bool {
+        self.cookies.len() == 1 + site.extras.len()
+    }
+}
+
+/// Turn one profile's `name → value` cookies into a session, or `None` when
+/// the primary login cookie is missing. Only the spec's cookies are kept, in
+/// spec order.
+fn assemble(site: &SiteCookies, mut found: HashMap<String, String>) -> Option<ImportedSession> {
+    found.get(site.primary)?;
+    let cookies = site
+        .names()
+        .filter_map(|name| found.remove(name).map(|val| (name.to_string(), val)))
+        .collect();
+    Some(ImportedSession { cookies })
 }
 
 fn def(id: &str) -> Option<&'static BrowserDef> {
@@ -96,19 +141,23 @@ pub fn list_installed() -> Vec<BrowserInfo> {
         .collect()
 }
 
-/// Import X auth cookies from the given browser id.
-pub fn import(browser_id: &str) -> Result<ImportedSession, CookieError> {
+/// Import a site's auth cookies from the given browser id.
+pub fn import(browser_id: &str, site: &SiteCookies) -> Result<ImportedSession, CookieError> {
     let d = def(browser_id).ok_or_else(|| CookieError::Unknown(browser_id.to_string()))?;
     let root = data_root(d).ok_or_else(|| CookieError::NotInstalled(d.label.to_string()))?;
     match d.kind {
-        BrowserKind::Chromium => import_chromium(d, &root),
-        BrowserKind::Firefox => import_firefox(d, &root),
+        BrowserKind::Chromium => import_chromium(d, &root, site),
+        BrowserKind::Firefox => import_firefox(d, &root, site),
     }
 }
 
 // --- Chromium ---------------------------------------------------------------
 
-fn import_chromium(d: &BrowserDef, root: &Path) -> Result<ImportedSession, CookieError> {
+fn import_chromium(
+    d: &BrowserDef,
+    root: &Path,
+    site: &SiteCookies,
+) -> Result<ImportedSession, CookieError> {
     let key = chromium_master_key(d, root)?;
 
     let mut fallback: Option<ImportedSession> = None;
@@ -120,12 +169,11 @@ fn import_chromium(d: &BrowserDef, root: &Path) -> Result<ImportedSession, Cooki
         if !db.is_file() {
             continue;
         }
-        let rows = read_db(d, &db, "SELECT name, encrypted_value FROM cookies WHERE name IN ('auth_token','ct0') AND (host_key LIKE '%x.com' OR host_key LIKE '%twitter.com')")?;
+        let rows = read_db(d, &db, &CHROMIUM_SCHEMA, site)?;
 
-        // Keep auth_token + ct0 paired per profile — mixing them across profiles
-        // would marry one account's token to another account's CSRF value.
-        let mut auth_token = None;
-        let mut ct0 = None;
+        // Keep the cookies paired per profile — mixing them across profiles
+        // would marry one account's login to another account's CSRF value.
+        let mut found = HashMap::new();
         for (name, blob) in rows {
             let val = match decrypt_chromium_value(d, &blob, &key) {
                 Ok(v) if !v.is_empty() => v,
@@ -137,22 +185,16 @@ fn import_chromium(d: &BrowserDef, root: &Path) -> Result<ImportedSession, Cooki
                     continue;
                 }
             };
-            match name.as_str() {
-                "auth_token" => auth_token = Some(val),
-                "ct0" => ct0 = Some(val),
-                _ => {}
-            }
+            found.insert(name, val);
         }
 
-        match (auth_token, ct0) {
+        match assemble(site, found) {
             // A complete session — prefer it and stop.
-            (Some(auth_token), Some(ct0)) => {
-                return Ok(ImportedSession { auth_token, ct0: Some(ct0) })
-            }
-            // auth_token only: remember the first as a fallback, but keep looking
-            // for a profile that also has the matching ct0.
-            (Some(auth_token), None) if fallback.is_none() => {
-                fallback = Some(ImportedSession { auth_token, ct0: None })
+            Some(s) if s.is_complete(site) => return Ok(s),
+            // Login cookie but some extras missing: remember the fullest one as
+            // a fallback, but keep looking for a profile that has them all.
+            Some(s) if fallback.as_ref().is_none_or(|f| s.cookies.len() > f.cookies.len()) => {
+                fallback = Some(s)
             }
             _ => {}
         }
@@ -162,7 +204,7 @@ fn import_chromium(d: &BrowserDef, root: &Path) -> Result<ImportedSession, Cooki
         if had_decrypt_error {
             CookieError::Decrypt(d.label.to_string())
         } else {
-            CookieError::NoCookies(d.label.to_string())
+            CookieError::NoCookies { browser: d.label.to_string(), site: site.label }
         }
     })
 }
@@ -238,10 +280,12 @@ fn decrypt_chromium_value(d: &BrowserDef, enc: &[u8], key: &[u8]) -> Result<Stri
 
 // --- Firefox ----------------------------------------------------------------
 
-fn import_firefox(d: &BrowserDef, root: &Path) -> Result<ImportedSession, CookieError> {
+fn import_firefox(
+    d: &BrowserDef,
+    root: &Path,
+    site: &SiteCookies,
+) -> Result<ImportedSession, CookieError> {
     let profiles = root.join("Profiles");
-    let mut auth_token = None;
-    let mut ct0 = None;
 
     if let Ok(entries) = fs::read_dir(&profiles) {
         for e in entries.flatten() {
@@ -249,34 +293,68 @@ fn import_firefox(d: &BrowserDef, root: &Path) -> Result<ImportedSession, Cookie
             if !db.is_file() {
                 continue;
             }
-            let rows = read_db(d, &db, "SELECT name, value FROM moz_cookies WHERE name IN ('auth_token','ct0') AND (host LIKE '%x.com' OR host LIKE '%twitter.com')")?;
-            for (name, blob) in rows {
-                let val = String::from_utf8_lossy(&blob).into_owned();
-                match name.as_str() {
-                    "auth_token" if !val.is_empty() => auth_token = Some(val),
-                    "ct0" if !val.is_empty() => ct0 = Some(val),
-                    _ => {}
-                }
-            }
-            if auth_token.is_some() {
-                break;
+            let rows = read_db(d, &db, &FIREFOX_SCHEMA, site)?;
+            let found: HashMap<String, String> = rows
+                .into_iter()
+                .map(|(name, blob)| (name, String::from_utf8_lossy(&blob).into_owned()))
+                .filter(|(_, val)| !val.is_empty())
+                .collect();
+            // First profile with a login wins.
+            if let Some(s) = assemble(site, found) {
+                return Ok(s);
             }
         }
     }
 
-    match auth_token {
-        Some(auth_token) => Ok(ImportedSession { auth_token, ct0 }),
-        None => Err(CookieError::NoCookies(d.label.to_string())),
-    }
+    Err(CookieError::NoCookies { browser: d.label.to_string(), site: site.label })
 }
 
 // --- SQLite helper ----------------------------------------------------------
 
-/// Copy the (possibly browser-locked) DB to a temp file and run `query`,
-/// returning `(name, value-bytes)` rows. Firefox `value` comes back as text
-/// bytes; Chromium `encrypted_value` as the raw blob.
-fn read_db(d: &BrowserDef, db: &Path, query: &str) -> Result<Vec<(String, Vec<u8>)>, CookieError> {
-    use rusqlite::{Connection, OpenFlags};
+/// Where a browser family keeps its cookies; the table and column names differ.
+struct CookieSchema {
+    table: &'static str,
+    value_col: &'static str,
+    host_col: &'static str,
+}
+
+const CHROMIUM_SCHEMA: CookieSchema = CookieSchema {
+    table: "cookies",
+    value_col: "encrypted_value",
+    host_col: "host_key",
+};
+
+const FIREFOX_SCHEMA: CookieSchema = CookieSchema {
+    table: "moz_cookies",
+    value_col: "value",
+    host_col: "host",
+};
+
+/// Copy the (possibly browser-locked) DB to a temp file and select the site's
+/// cookies, returning `(name, value-bytes)` rows. Firefox `value` comes back as
+/// text bytes; Chromium `encrypted_value` as the raw blob.
+fn read_db(
+    d: &BrowserDef,
+    db: &Path,
+    schema: &CookieSchema,
+    site: &SiteCookies,
+) -> Result<Vec<(String, Vec<u8>)>, CookieError> {
+    use rusqlite::{params_from_iter, Connection, OpenFlags};
+
+    // Names and hosts are bound as parameters; only the static schema
+    // identifiers are interpolated.
+    let name_marks = vec!["?"; site.names().count()].join(",");
+    let host_marks = site
+        .hosts
+        .iter()
+        .map(|_| format!("{} LIKE ?", schema.host_col))
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let query = format!(
+        "SELECT name, {} FROM {} WHERE name IN ({name_marks}) AND ({host_marks})",
+        schema.value_col, schema.table
+    );
+    let params: Vec<&str> = site.names().chain(site.hosts.iter().copied()).collect();
 
     let label = d.label.to_string();
     let copy = TempCopy::new(db).map_err(|e| CookieError::Db(label.clone(), e))?;
@@ -288,10 +366,10 @@ fn read_db(d: &BrowserDef, db: &Path, query: &str) -> Result<Vec<(String, Vec<u8
     .map_err(|e| CookieError::Db(label.clone(), e.to_string()))?;
 
     let mut stmt = conn
-        .prepare(query)
+        .prepare(&query)
         .map_err(|e| CookieError::Db(label.clone(), e.to_string()))?;
     let rows = stmt
-        .query_map([], |row| {
+        .query_map(params_from_iter(params), |row| {
             let name: String = row.get(0)?;
             let value: Vec<u8> = row.get(1)?;
             Ok((name, value))

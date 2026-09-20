@@ -1,9 +1,11 @@
 mod cookies;
+mod media;
 mod twitter;
 
 use cookies::BrowserInfo;
 use serde::Serialize;
-use twitter::{MediaItem, TwitterScraper};
+use media::MediaItem;
+use twitter::TwitterScraper;
 
 /// How many media items per page request to X.
 const PAGE_SIZE: u32 = 20;
@@ -57,7 +59,7 @@ async fn fetch_user_media(
     let session = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
         Some(id) => {
             let id = id.to_string();
-            let imported = tauri::async_runtime::spawn_blocking(move || cookies::import(&id))
+            let imported = tauri::async_runtime::spawn_blocking(move || cookies::import(&id, &cookies::X))
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
