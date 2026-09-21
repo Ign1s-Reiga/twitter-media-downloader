@@ -21,7 +21,7 @@ export const PLATFORMS: PlatformInfo[] = [
     placeholder: 'https://x.com/username or @username',
     tokenCookie: 'auth_token',
     extraCookie: 'ct0',
-    guestNote: 'Guest mode works only for public accounts and is heavily rate-limited by X.',
+    guestNote: 'X no longer serves media timelines to guests, so a logged-in browser or a token is effectively required.',
   },
   {
     id: 'instagram',

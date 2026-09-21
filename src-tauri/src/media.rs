@@ -28,3 +28,30 @@ pub struct MediaPage {
     pub items: Vec<MediaItem>,
     pub next_cursor: Option<String>,
 }
+
+/// Which media kinds the caller asked for.
+pub struct MediaFilter {
+    pub images: bool,
+    pub videos: bool,
+}
+
+impl MediaFilter {
+    pub fn from(filters: Option<&[String]>) -> Self {
+        match filters {
+            // No selection means "everything".
+            None | Some([]) => Self { images: true, videos: true },
+            Some(f) => Self {
+                images: f.iter().any(|x| x == "images"),
+                videos: f.iter().any(|x| x == "videos"),
+            },
+        }
+    }
+
+    pub fn accepts(&self, media_type: &str) -> bool {
+        match media_type {
+            "photo" => self.images,
+            "video" | "animated_gif" => self.videos,
+            _ => true,
+        }
+    }
+}

@@ -5,7 +5,7 @@ mod twitter;
 
 use cookies::BrowserInfo;
 use instagram::InstagramScraper;
-use media::{MediaItem, MediaPage};
+use media::{MediaFilter, MediaItem, MediaPage};
 use serde::Serialize;
 use twitter::TwitterScraper;
 
@@ -103,15 +103,19 @@ impl Scraper {
         }
     }
 
+    /// Fetch one page. `wants` lets a platform skip media kinds at the source
+    /// (X serves photos and videos from separate timelines); the caller still
+    /// filters the result, so honouring it is optional.
     async fn fetch_media_page(
         &mut self,
         user_id: &str,
         cursor: Option<&str>,
         count: u32,
+        wants: &MediaFilter,
     ) -> Result<MediaPage, String> {
         match self {
             Self::X(s) => s
-                .fetch_media_page(user_id, cursor, count)
+                .fetch_media_page(user_id, cursor, count, wants)
                 .await
                 .map_err(|e| e.to_string()),
             Self::Instagram(s) => s
@@ -185,7 +189,7 @@ async fn fetch_user_media(
 
     for _ in 0..MAX_PAGES {
         let page = scraper
-            .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE)
+            .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE, &wants)
             .await?;
 
         let page_cursor = page.next_cursor.clone();
@@ -205,8 +209,7 @@ async fn fetch_user_media(
 
         // Follow the cursor even on a page that yielded no media (X returns
         // cursor-only / interstitial pages; Instagram pages can be all
-        // filtered out). Stop when there's no cursor or it stops advancing (X
-        // echoes the same bottom cursor at the end).
+        // filtered out). Stop when there's no cursor or it stops advancing.
         match page_cursor {
             Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
             _ => {
@@ -217,34 +220,6 @@ async fn fetch_user_media(
     }
 
     Ok(MediaResponse { items, next_cursor })
-}
-
-/// Which media kinds the caller asked for.
-struct MediaFilter {
-    images: bool,
-    videos: bool,
-}
-
-impl MediaFilter {
-    fn from(filters: Option<&[String]>) -> Self {
-        match filters {
-            // No selection means "everything".
-            None => Self { images: true, videos: true },
-            Some(f) if f.is_empty() => Self { images: true, videos: true },
-            Some(f) => Self {
-                images: f.iter().any(|x| x == "images"),
-                videos: f.iter().any(|x| x == "videos"),
-            },
-        }
-    }
-
-    fn accepts(&self, media_type: &str) -> bool {
-        match media_type {
-            "photo" => self.images,
-            "video" | "animated_gif" => self.videos,
-            _ => true,
-        }
-    }
 }
 
 /// Download a single media URL into the OS Downloads folder. Returns the saved
