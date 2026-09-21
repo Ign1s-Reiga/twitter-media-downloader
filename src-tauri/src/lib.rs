@@ -256,24 +256,8 @@ async fn download_media(
     filename: String,
     dir: Option<String>,
 ) -> Result<String, String> {
-    use tauri::Manager;
-
     let referer = cdn_referer(&url).ok_or_else(|| "host not allowed".to_string())?;
-
-    // Save into the user-specified folder when given (creating it if needed),
-    // else the OS Downloads dir (which always exists).
-    let base = match dir.as_deref().map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => {
-            let p = std::path::PathBuf::from(d);
-            std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
-            p
-        }
-        None => app
-            .path()
-            .download_dir()
-            .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
-    };
-    let dest = unique_path(&base, &sanitize_filename(&filename));
+    let dest = resolve_dest(&app, dir.as_deref(), &filename)?;
 
     let client = reqwest::Client::builder()
         .user_agent(MEDIA_UA)
@@ -291,7 +275,71 @@ async fn download_media(
         .await
         .map_err(|e| e.to_string())?;
 
-    // Writing a potentially-large file is blocking; keep it off the async runtime.
+    write_file(dest, bytes.to_vec()).await
+}
+
+/// Save a video frame captured in the preview dialog. The PNG arrives as the
+/// raw IPC body (megabytes of image data are a poor fit for JSON); the target
+/// filename and folder ride along as percent-encoded headers, since header
+/// values can't carry non-ASCII paths directly.
+#[tauri::command]
+async fn save_frame(
+    app: tauri::AppHandle,
+    request: tauri::ipc::Request<'_>,
+) -> Result<String, String> {
+    use tauri::ipc::InvokeBody;
+
+    let bytes = match request.body() {
+        InvokeBody::Raw(b) => b.clone(),
+        InvokeBody::Json(_) => return Err("expected raw image bytes".to_string()),
+    };
+    if bytes.is_empty() {
+        return Err("the captured frame was empty".to_string());
+    }
+    let header = |name: &str| -> Result<Option<String>, String> {
+        match request.headers().get(name) {
+            Some(v) => {
+                let raw = v.to_str().map_err(|e| e.to_string())?;
+                let decoded = urlencoding::decode(raw).map_err(|e| e.to_string())?;
+                Ok(Some(decoded.into_owned()))
+            }
+            None => Ok(None),
+        }
+    };
+    let filename = header("x-filename")?.ok_or_else(|| "missing filename".to_string())?;
+    let dir = header("x-dir")?;
+
+    let dest = resolve_dest(&app, dir.as_deref(), &filename)?;
+    write_file(dest, bytes).await
+}
+
+/// Where to save a file: the user-specified folder when given (creating it if
+/// needed), else the OS Downloads dir (which always exists) — never clobbering
+/// an existing file.
+fn resolve_dest(
+    app: &tauri::AppHandle,
+    dir: Option<&str>,
+    filename: &str,
+) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+
+    let base = match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => {
+            let p = std::path::PathBuf::from(d);
+            std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
+            p
+        }
+        None => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
+    };
+    Ok(unique_path(&base, &sanitize_filename(filename)))
+}
+
+/// Write `bytes` to `dest` off the async runtime (a large file write blocks),
+/// returning the saved absolute path so the UI can offer "show in folder".
+async fn write_file(dest: std::path::PathBuf, bytes: Vec<u8>) -> Result<String, String> {
     let write_dest = dest.clone();
     tauri::async_runtime::spawn_blocking(move || std::fs::write(&write_dest, &bytes))
         .await
@@ -350,9 +398,22 @@ fn unique_path(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
 /// (`http://tauri.localhost`) as Referer, which can't be overridden client-side.
 /// So we fetch server-side with the CDN's own Referer, forward the Range header
 /// for seeking, and relay the bytes.
+///
+/// Responses carry CORS headers: the custom scheme is served from its own
+/// origin (`twmedia.localhost`), and the preview loads the video with
+/// `crossOrigin="anonymous"` so a `<canvas>` can grab a frame without being
+/// tainted — which only works if this origin says so.
 async fn proxy_media(
     request: tauri::http::Request<Vec<u8>>,
 ) -> Result<tauri::http::Response<Vec<u8>>, String> {
+    // A CORS preflight (the webview may send one before a Range request)
+    // needs nothing but the allow headers.
+    if request.method() == tauri::http::Method::OPTIONS {
+        return with_cors(tauri::http::Response::builder().status(204))
+            .body(Vec::new())
+            .map_err(|e| e.to_string());
+    }
+
     let encoded = request
         .uri()
         .query()
@@ -377,7 +438,7 @@ async fn proxy_media(
     }
     let upstream = req.send().await.map_err(|e| e.to_string())?;
 
-    let mut builder = tauri::http::Response::builder().status(upstream.status().as_u16());
+    let mut builder = with_cors(tauri::http::Response::builder().status(upstream.status().as_u16()));
     for name in [
         "content-type",
         "content-length",
@@ -391,6 +452,16 @@ async fn proxy_media(
     }
     let body = upstream.bytes().await.map_err(|e| e.to_string())?.to_vec();
     builder.body(body).map_err(|e| e.to_string())
+}
+
+/// CORS headers for the media proxy. `*` is fine: the proxy is read-only,
+/// credential-less, and already restricted to the CDN allowlist.
+fn with_cors(builder: tauri::http::response::Builder) -> tauri::http::response::Builder {
+    builder
+        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-methods", "GET, OPTIONS")
+        .header("access-control-allow-headers", "range")
+        .header("access-control-expose-headers", "content-length, content-range, accept-ranges")
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -412,14 +483,46 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             fetch_user_media,
             list_browsers,
-            download_media
+            download_media,
+            save_frame
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 #[cfg(test)]
 mod tests {
-    use super::cdn_referer;
+    use super::{cdn_referer, proxy_media};
+
+    fn proxy_request(method: &str, target: &str) -> tauri::http::Request<Vec<u8>> {
+        tauri::http::Request::builder()
+            .method(method)
+            .uri(format!("http://twmedia.localhost/?u={}", urlencoding::encode(target)))
+            .body(Vec::new())
+            .unwrap()
+    }
+
+    #[test]
+    fn proxy_answers_preflight_with_cors_headers() {
+        let resp = tauri::async_runtime::block_on(proxy_media(proxy_request(
+            "OPTIONS",
+            "https://video.twimg.com/a.mp4",
+        )))
+        .unwrap();
+        assert_eq!(resp.status(), 204);
+        let header = |n: &str| resp.headers().get(n).and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert_eq!(header("access-control-allow-origin"), "*");
+        assert!(header("access-control-allow-headers").contains("range"));
+    }
+
+    #[test]
+    fn proxy_rejects_hosts_outside_the_allowlist() {
+        let err = tauri::async_runtime::block_on(proxy_media(proxy_request(
+            "GET",
+            "https://evil.example/a.mp4",
+        )))
+        .unwrap_err();
+        assert_eq!(err, "host not allowed");
+    }
 
     #[test]
     fn cdn_referer_allows_known_media_hosts() {

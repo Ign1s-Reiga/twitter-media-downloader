@@ -1,9 +1,10 @@
 'use client';
 
-import { useState } from 'react';
-import { openUrl } from '@tauri-apps/plugin-opener';
+import { useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { openUrl, revealItemInDir } from '@tauri-apps/plugin-opener';
 import { toast } from 'sonner';
-import { CheckIcon, DownloadIcon, ExternalLinkIcon, FilmIcon, LinkIcon, PlayIcon } from 'lucide-react';
+import { CameraIcon, CheckIcon, DownloadIcon, ExternalLinkIcon, FilmIcon, LinkIcon, PlayIcon } from 'lucide-react';
 import { AspectRatio } from '@/components/ui/aspect-ratio';
 import { Button } from '@/components/ui/button';
 import {
@@ -16,7 +17,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import { MediaItem } from '@/lib/media';
+import { MediaItem, frameFilename } from '@/lib/media';
 import { useDownloads } from '@/components/download-provider';
 
 /**
@@ -54,8 +55,10 @@ export function MediaCard({
   const isGif = item.media_type === 'animated_gif';
   const isPlayable = isVideo || isGif;
   const kind = isGif ? 'GIF' : isVideo ? 'Video' : 'Image';
-  const { enqueue } = useDownloads();
+  const { enqueue, downloadDir } = useDownloads();
   const [downloading, setDownloading] = useState(false);
+  const [capturing, setCapturing] = useState(false);
+  const videoRef = useRef<HTMLVideoElement>(null);
 
   const download = async () => {
     setDownloading(true);
@@ -63,6 +66,53 @@ export function MediaCard({
       await enqueue([item], kind);
     } finally {
       setDownloading(false);
+    }
+  };
+
+  /**
+   * Save the frame the video is showing right now as a PNG. A playing video is
+   * paused first so what's on screen is exactly what gets saved (GIFs have no
+   * controls to resume with, so they keep looping).
+   */
+  const captureFrame = async () => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+      toast.warning('The video has not loaded a frame yet.');
+      return;
+    }
+    if (isVideo && !video.paused) video.pause();
+
+    setCapturing(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      canvas.getContext('2d')?.drawImage(video, 0, 0);
+      // toBlob throws a SecurityError here if the video tainted the canvas
+      // (i.e. the proxy stopped sending CORS headers); the catch below reports it.
+      const blob = await new Promise<Blob | null>((resolve) => canvas.toBlob(resolve, 'image/png'));
+      if (!blob) throw new Error('Could not encode the frame.');
+
+      const filename = frameFilename(item, video.currentTime);
+      // Raw bytes as the IPC body; the paths go in headers, percent-encoded
+      // because header values can't carry non-ASCII folder names.
+      const path = await invoke<string>('save_frame', new Uint8Array(await blob.arrayBuffer()), {
+        headers: {
+          'x-filename': encodeURIComponent(filename),
+          'x-dir': encodeURIComponent(downloadDir ?? ''),
+        },
+      });
+      toast.success('Frame saved.', {
+        description: filename,
+        action: { label: 'Show', onClick: () => void revealItemInDir(path).catch(() => {}) },
+      });
+    } catch (err) {
+      toast.error('Failed to capture the frame.', {
+        description: typeof err === 'string' ? err : String(err),
+      });
+    } finally {
+      setCapturing(false);
     }
   };
 
@@ -147,8 +197,12 @@ export function MediaCard({
         <div className="flex max-h-[70vh] items-center justify-center overflow-hidden rounded-lg bg-muted/40">
           {isPlayable ? (
             <video
+              ref={videoRef}
               src={proxied(item.download_url)}
-              poster={item.thumbnail_url}
+              // crossOrigin makes the poster a CORS fetch as well, and the CDNs
+              // don't reliably allow that — so it goes through the proxy too.
+              poster={proxied(item.thumbnail_url)}
+              crossOrigin="anonymous"
               controls={isVideo}
               autoPlay={isGif}
               loop={isGif}
@@ -168,6 +222,12 @@ export function MediaCard({
             Copy link
           </Button>
           <div className="flex gap-2">
+            {isPlayable && (
+              <Button variant="outline" onClick={captureFrame} disabled={capturing}>
+                <CameraIcon className="mr-1" />
+                {capturing ? 'Capturing…' : 'Capture frame'}
+              </Button>
+            )}
             <Button variant="outline" onClick={() => void openUrl(item.post_url)}>
               <ExternalLinkIcon className="mr-1" />
               Open post
