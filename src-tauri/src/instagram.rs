@@ -232,7 +232,7 @@ impl InstagramScraper {
             // A non-JSON body on an error status is the HTML login/challenge
             // wall; on a success status it's a schema change.
             Err(_) if status.is_success() => return Err(ScrapeError::Parse),
-            Err(_) => return Err(self.classify_error(status, "")),
+            Err(_) => return Err(self.classify_error(status, "", false)),
         };
 
         if status.is_success() {
@@ -243,12 +243,14 @@ impl InstagramScraper {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        Err(self.classify_error(status, &msg))
+        // The login wall says so explicitly, with a localised message.
+        let require_login = body.get("require_login").and_then(Value::as_bool) == Some(true);
+        Err(self.classify_error(status, &msg, require_login))
     }
 
     /// Map a failed response to the most specific error we can name. Every
     /// variant carries Instagram's own status/message for diagnosis.
-    fn classify_error(&self, status: reqwest::StatusCode, message: &str) -> ScrapeError {
+    fn classify_error(&self, status: reqwest::StatusCode, message: &str, require_login: bool) -> ScrapeError {
         let lower = message.to_ascii_lowercase();
         let code = status.as_u16();
         let detail = if message.is_empty() {
@@ -257,7 +259,8 @@ impl InstagramScraper {
             format!("HTTP {code}: {message}")
         };
         let rate_limited = code == 429 || lower.contains("please wait a few minutes");
-        let login_wall = matches!(code, 401 | 403)
+        let login_wall = require_login
+            || matches!(code, 401 | 403)
             || lower.contains("login_required")
             || lower.contains("checkpoint_required")
             || lower.contains("challenge_required");

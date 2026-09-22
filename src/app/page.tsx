@@ -18,7 +18,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import { MediaCard } from '@/components/media-card';
 import { MediaItem } from '@/lib/media';
-import { PLATFORMS, platformInfo, type Platform } from '@/lib/platform';
+import { PLATFORMS, platformFromInput, platformInfo, type Platform } from '@/lib/platform';
 import { PLATFORM_ICONS } from '@/components/platform-icons';
 import { Spinner } from '@/components/ui/spinner';
 import { useDownloads, type DownloadStatus } from '@/components/download-provider';
@@ -83,6 +83,14 @@ export default function Page() {
   // The backend addresses a container as `firefox:<id>`.
   const browserImportId =
     selectedContainer === NO_CONTAINER ? accountSource : `${accountSource}:${selectedContainer}`;
+
+  // A pasted profile URL says which site it's for — flip the toggle rather
+  // than making the user do it (and then rejecting the URL if they forget).
+  const onAccountUrlChange = (value: string) => {
+    setAccountUrl(value);
+    const detected = platformFromInput(value);
+    if (detected) setPlatform(detected);
+  };
 
   const scrollResultsToTop = () => {
     resultsRef.current
@@ -207,7 +215,7 @@ export default function Page() {
                     <InputGroupInput
                       placeholder={info.placeholder}
                       value={accountUrl}
-                      onChange={(e) => setAccountUrl(e.target.value)}
+                      onChange={(e) => onAccountUrlChange(e.target.value)}
                       onKeyDown={onAccountKeyDown}
                       disabled={loading}
                     />
