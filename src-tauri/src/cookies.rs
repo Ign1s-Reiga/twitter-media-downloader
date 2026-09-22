@@ -6,12 +6,17 @@
 //!   itself wrapped with Windows DPAPI. Very recent Chrome (v20 "app-bound"
 //!   encryption) can't be unwrapped this way — we surface a clear error and let
 //!   the user fall back to a manual token or a different browser.
-//! * Firefox: cookies are stored unencrypted in `cookies.sqlite`.
+//! * Firefox: cookies are stored unencrypted in `cookies.sqlite`. Multi-Account
+//!   Containers keep separate jars in the same table, told apart by the
+//!   `originAttributes` column — each container is offered as its own entry so
+//!   a scraping-account container can be picked over the main login.
 //!
-//! We only ever read the handful of cookies a `SiteCookies` spec names, for
-//! that site's hosts.
+//! We read every cookie stored for the site's hosts (a `SiteCookies` spec)
+//! and nothing else: sites like Instagram treat a session cookie that shows
+//! up without the device cookies issued alongside it (`mid`, `datr`, …) as
+//! suspicious, so the whole jar travels together.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -47,13 +52,20 @@ struct BrowserDef {
     base_env: &'static str,
     /// Path under that base dir to the browser's data root.
     rel_path: &'static str,
+    /// A User-Agent of this browser family, so requests made with its cookies
+    /// look like they come from the browser that owns the session.
+    user_agent: &'static str,
 }
 
+const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const EDGE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0";
+const FIREFOX_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
 const BROWSERS: &[BrowserDef] = &[
-    BrowserDef { id: "chrome", label: "Google Chrome", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"Google\Chrome\User Data" },
-    BrowserDef { id: "edge", label: "Microsoft Edge", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"Microsoft\Edge\User Data" },
-    BrowserDef { id: "brave", label: "Brave", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"BraveSoftware\Brave-Browser\User Data" },
-    BrowserDef { id: "firefox", label: "Firefox", kind: BrowserKind::Firefox, base_env: "APPDATA", rel_path: r"Mozilla\Firefox" },
+    BrowserDef { id: "chrome", label: "Google Chrome", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"Google\Chrome\User Data", user_agent: CHROME_UA },
+    BrowserDef { id: "edge", label: "Microsoft Edge", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"Microsoft\Edge\User Data", user_agent: EDGE_UA },
+    BrowserDef { id: "brave", label: "Brave", kind: BrowserKind::Chromium, base_env: "LOCALAPPDATA", rel_path: r"BraveSoftware\Brave-Browser\User Data", user_agent: CHROME_UA },
+    BrowserDef { id: "firefox", label: "Firefox", kind: BrowserKind::Firefox, base_env: "APPDATA", rel_path: r"Mozilla\Firefox", user_agent: FIREFOX_UA },
 ];
 
 /// A browser the user has installed, for the frontend account picker.
@@ -61,15 +73,46 @@ const BROWSERS: &[BrowserDef] = &[
 pub struct BrowserInfo {
     pub id: String,
     pub label: String,
+    /// Firefox Multi-Account Containers (empty for other browsers). One is
+    /// picked by importing with the id `firefox:<container id>`.
+    pub containers: Vec<FirefoxContainer>,
 }
 
-/// Which cookies make up a login on a given site.
+/// A Firefox Multi-Account Container.
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct FirefoxContainer {
+    /// `userContextId`; the default (container-less) tab is not one of these.
+    pub id: u32,
+    pub name: String,
+}
+
+/// Which Firefox cookie jar to read: the default one, or a container's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirefoxJar {
+    Default,
+    Container(u32),
+}
+
+impl FirefoxJar {
+    /// The exact `originAttributes` value of first-party cookies in this jar.
+    /// (Partitioned third-party cookies carry extra attributes and are
+    /// deliberately left out.)
+    fn origin_attributes(self) -> String {
+        match self {
+            Self::Default => String::new(),
+            Self::Container(id) => format!("^userContextId={id}"),
+        }
+    }
+}
+
+/// What a login on a given site looks like in a cookie jar.
 pub struct SiteCookies {
     /// Human-readable site name for error messages.
     pub label: &'static str,
     /// The login cookie a session can't work without.
     pub primary: &'static str,
-    /// Cookies worth carrying alongside it when present (CSRF tokens etc.).
+    /// Cookies a fully usable session also has (CSRF tokens etc.) — used to
+    /// prefer one browser profile over another, not to limit what's read.
     pub extras: &'static [&'static str],
     /// SQL `LIKE` patterns matched against the cookie's host.
     pub hosts: &'static [&'static str],
@@ -97,8 +140,10 @@ pub const INSTAGRAM: SiteCookies = SiteCookies {
 
 /// Credentials lifted from a browser, ready to hand to a scraper.
 pub struct ImportedSession {
-    /// `(name, value)` pairs; the site's primary cookie is always among them.
+    /// Every cookie the browser holds for the site, primary first.
     cookies: Vec<(String, String)>,
+    /// User-Agent of the browser the cookies came from.
+    pub user_agent: &'static str,
 }
 
 impl ImportedSession {
@@ -111,22 +156,36 @@ impl ImportedSession {
             .join("; ")
     }
 
-    /// Every cookie the site spec asked for was found.
+    /// How many of the spec's cookies (primary + extras) this session has.
+    fn spec_hits(&self, site: &SiteCookies) -> usize {
+        site.names()
+            .filter(|name| self.cookies.iter().any(|(k, _)| k == name))
+            .count()
+    }
+
+    /// Every cookie the site spec names was found.
     fn is_complete(&self, site: &SiteCookies) -> bool {
-        self.cookies.len() == 1 + site.extras.len()
+        self.spec_hits(site) == 1 + site.extras.len()
     }
 }
 
 /// Turn one profile's `name → value` cookies into a session, or `None` when
-/// the primary login cookie is missing. Only the spec's cookies are kept, in
-/// spec order.
-fn assemble(site: &SiteCookies, mut found: HashMap<String, String>) -> Option<ImportedSession> {
+/// the primary login cookie is missing. Everything is kept: the spec's cookies
+/// first, in spec order, then the rest by name.
+fn assemble(
+    site: &SiteCookies,
+    d: &BrowserDef,
+    mut found: HashMap<String, String>,
+) -> Option<ImportedSession> {
     found.get(site.primary)?;
-    let cookies = site
+    let mut cookies: Vec<(String, String)> = site
         .names()
         .filter_map(|name| found.remove(name).map(|val| (name.to_string(), val)))
         .collect();
-    Some(ImportedSession { cookies })
+    let mut rest: Vec<(String, String)> = found.into_iter().collect();
+    rest.sort();
+    cookies.extend(rest);
+    Some(ImportedSession { cookies, user_agent: d.user_agent })
 }
 
 fn def(id: &str) -> Option<&'static BrowserDef> {
@@ -139,22 +198,42 @@ fn data_root(d: &BrowserDef) -> Option<PathBuf> {
     p.is_dir().then_some(p)
 }
 
-/// Browsers that are actually installed (have a data folder present).
+/// Browsers that are actually installed (have a data folder present), with
+/// Firefox's containers attached.
 pub fn list_installed() -> Vec<BrowserInfo> {
     BROWSERS
         .iter()
-        .filter(|d| data_root(d).is_some())
-        .map(|d| BrowserInfo { id: d.id.to_string(), label: d.label.to_string() })
+        .filter_map(|d| {
+            let root = data_root(d)?;
+            let containers = match d.kind {
+                BrowserKind::Firefox => firefox_containers(&root),
+                BrowserKind::Chromium => Vec::new(),
+            };
+            Some(BrowserInfo { id: d.id.to_string(), label: d.label.to_string(), containers })
+        })
         .collect()
 }
 
-/// Import a site's auth cookies from the given browser id.
+/// Import a site's auth cookies from the given browser id (`chrome`,
+/// `firefox`, `firefox:<contextId>` …).
 pub fn import(browser_id: &str, site: &SiteCookies) -> Result<ImportedSession, CookieError> {
-    let d = def(browser_id).ok_or_else(|| CookieError::Unknown(browser_id.to_string()))?;
+    let unknown = || CookieError::Unknown(browser_id.to_string());
+    let (base, container) = match browser_id.split_once(':') {
+        Some((base, ctx)) => (base, Some(ctx.parse::<u32>().map_err(|_| unknown())?)),
+        None => (browser_id, None),
+    };
+    let d = def(base).ok_or_else(unknown)?;
+    // Only Firefox has containers.
+    if d.kind != BrowserKind::Firefox && container.is_some() {
+        return Err(unknown());
+    }
     let root = data_root(d).ok_or_else(|| CookieError::NotInstalled(d.label.to_string()))?;
     match d.kind {
         BrowserKind::Chromium => import_chromium(d, &root, site),
-        BrowserKind::Firefox => import_firefox(d, &root, site),
+        BrowserKind::Firefox => {
+            let jar = container.map_or(FirefoxJar::Default, FirefoxJar::Container);
+            import_firefox(d, &root, site, jar)
+        }
     }
 }
 
@@ -176,7 +255,7 @@ fn import_chromium(
         if !db.is_file() {
             continue;
         }
-        let rows = read_db(d, &db, &CHROMIUM_SCHEMA, site)?;
+        let rows = read_db(d, &db, &CHROMIUM_SCHEMA, site, None)?;
 
         // Keep the cookies paired per profile — mixing them across profiles
         // would marry one account's login to another account's CSRF value.
@@ -195,12 +274,12 @@ fn import_chromium(
             found.insert(name, val);
         }
 
-        match assemble(site, found) {
+        match assemble(site, d, found) {
             // A complete session — prefer it and stop.
             Some(s) if s.is_complete(site) => return Ok(s),
             // Login cookie but some extras missing: remember the fullest one as
             // a fallback, but keep looking for a profile that has them all.
-            Some(s) if fallback.as_ref().is_none_or(|f| s.cookies.len() > f.cookies.len()) => {
+            Some(s) if fallback.as_ref().is_none_or(|f| s.spec_hits(site) > f.spec_hits(site)) => {
                 fallback = Some(s)
             }
             _ => {}
@@ -291,29 +370,109 @@ fn import_firefox(
     d: &BrowserDef,
     root: &Path,
     site: &SiteCookies,
+    jar: FirefoxJar,
 ) -> Result<ImportedSession, CookieError> {
-    let profiles = root.join("Profiles");
+    let origin_attributes = jar.origin_attributes();
 
-    if let Ok(entries) = fs::read_dir(&profiles) {
-        for e in entries.flatten() {
-            let db = e.path().join("cookies.sqlite");
-            if !db.is_file() {
-                continue;
-            }
-            let rows = read_db(d, &db, &FIREFOX_SCHEMA, site)?;
-            let found: HashMap<String, String> = rows
-                .into_iter()
-                .map(|(name, blob)| (name, String::from_utf8_lossy(&blob).into_owned()))
-                .filter(|(_, val)| !val.is_empty())
-                .collect();
-            // First profile with a login wins.
-            if let Some(s) = assemble(site, found) {
-                return Ok(s);
-            }
+    for profile in firefox_profiles(root) {
+        let db = profile.join("cookies.sqlite");
+        if !db.is_file() {
+            continue;
+        }
+        let rows = read_db(d, &db, &FIREFOX_SCHEMA, site, Some(&origin_attributes))?;
+        let found: HashMap<String, String> = rows
+            .into_iter()
+            .map(|(name, blob)| (name, String::from_utf8_lossy(&blob).into_owned()))
+            .filter(|(_, val)| !val.is_empty())
+            .collect();
+        // First profile with a login wins.
+        if let Some(s) = assemble(site, d, found) {
+            return Ok(s);
         }
     }
 
-    Err(CookieError::NoCookies { browser: d.label.to_string(), site: site.label })
+    // Name the container in the error so "no login" points at the right jar.
+    let browser = match jar {
+        FirefoxJar::Default => d.label.to_string(),
+        FirefoxJar::Container(id) => {
+            let name = firefox_containers(root)
+                .into_iter()
+                .find(|c| c.id == id)
+                .map(|c| c.name)
+                .unwrap_or_else(|| format!("container {id}"));
+            format!("{} · {name}", d.label)
+        }
+    };
+    Err(CookieError::NoCookies { browser, site: site.label })
+}
+
+fn firefox_profiles(root: &Path) -> Vec<PathBuf> {
+    fs::read_dir(root.join("Profiles"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.is_dir())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Multi-Account Containers defined across the profiles' `containers.json`,
+/// by id. Built-in ones have an `l10nId` instead of a name.
+fn firefox_containers(root: &Path) -> Vec<FirefoxContainer> {
+    let mut by_id: BTreeMap<u32, String> = BTreeMap::new();
+    for profile in firefox_profiles(root) {
+        let Ok(text) = fs::read_to_string(profile.join("containers.json")) else { continue };
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
+        for c in parse_containers(&json) {
+            by_id.entry(c.id).or_insert(c.name);
+        }
+    }
+    by_id
+        .into_iter()
+        .map(|(id, name)| FirefoxContainer { id, name })
+        .collect()
+}
+
+fn parse_containers(json: &serde_json::Value) -> Vec<FirefoxContainer> {
+    use serde_json::Value;
+
+    json.get("identities")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        // `public: false` marks Firefox's internal pseudo-containers.
+        .filter(|c| c.get("public").and_then(Value::as_bool) == Some(true))
+        .filter_map(|c| {
+            let id = c.get("userContextId").and_then(Value::as_u64)?;
+            let id = u32::try_from(id).ok()?;
+            let name = c
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|n| !n.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    c.get("l10nId")
+                        .or_else(|| c.get("l10nID"))
+                        .and_then(Value::as_str)
+                        .map(builtin_container_name)
+                })
+                .unwrap_or_else(|| format!("Container {id}"));
+            Some(FirefoxContainer { id, name })
+        })
+        .collect()
+}
+
+/// English label for a built-in container's l10n id (`user-context-personal`
+/// / `userContextPersonal.label` …).
+fn builtin_container_name(l10n: &str) -> String {
+    let key = l10n.to_ascii_lowercase();
+    ["Personal", "Work", "Banking", "Shopping"]
+        .into_iter()
+        .find(|name| key.contains(&name.to_ascii_lowercase()))
+        .map(str::to_string)
+        .unwrap_or_else(|| l10n.to_string())
 }
 
 // --- SQLite helper ----------------------------------------------------------
@@ -323,45 +482,54 @@ struct CookieSchema {
     table: &'static str,
     value_col: &'static str,
     host_col: &'static str,
+    /// Column separating cookie jars (Firefox containers), if the browser has one.
+    jar_col: Option<&'static str>,
 }
 
 const CHROMIUM_SCHEMA: CookieSchema = CookieSchema {
     table: "cookies",
     value_col: "encrypted_value",
     host_col: "host_key",
+    jar_col: None,
 };
 
 const FIREFOX_SCHEMA: CookieSchema = CookieSchema {
     table: "moz_cookies",
     value_col: "value",
     host_col: "host",
+    jar_col: Some("originAttributes"),
 };
 
-/// Copy the (possibly browser-locked) DB to a temp file and select the site's
-/// cookies, returning `(name, value-bytes)` rows. Firefox `value` comes back as
-/// text bytes; Chromium `encrypted_value` as the raw blob.
+/// Copy the (possibly browser-locked) DB to a temp file and select every
+/// cookie on the site's hosts — within one jar, when the schema has jars and
+/// `jar` names it — returning `(name, value-bytes)` rows. Firefox `value` comes
+/// back as text bytes; Chromium `encrypted_value` as the raw blob.
 fn read_db(
     d: &BrowserDef,
     db: &Path,
     schema: &CookieSchema,
     site: &SiteCookies,
+    jar: Option<&str>,
 ) -> Result<Vec<(String, Vec<u8>)>, CookieError> {
     use rusqlite::{params_from_iter, Connection, OpenFlags};
 
-    // Names and hosts are bound as parameters; only the static schema
+    // Hosts and the jar are bound as parameters; only the static schema
     // identifiers are interpolated.
-    let name_marks = vec!["?"; site.names().count()].join(",");
     let host_marks = site
         .hosts
         .iter()
         .map(|_| format!("{} LIKE ?", schema.host_col))
         .collect::<Vec<_>>()
         .join(" OR ");
-    let query = format!(
-        "SELECT name, {} FROM {} WHERE name IN ({name_marks}) AND ({host_marks})",
+    let mut query = format!(
+        "SELECT name, {} FROM {} WHERE ({host_marks})",
         schema.value_col, schema.table
     );
-    let params: Vec<&str> = site.names().chain(site.hosts.iter().copied()).collect();
+    let mut params: Vec<&str> = site.hosts.to_vec();
+    if let (Some(col), Some(jar)) = (schema.jar_col, jar) {
+        query.push_str(&format!(" AND {col} = ?"));
+        params.push(jar);
+    }
 
     let label = d.label.to_string();
     let copy = TempCopy::new(db).map_err(|e| CookieError::Db(label.clone(), e))?;
@@ -378,7 +546,9 @@ fn read_db(
     let rows = stmt
         .query_map(params_from_iter(params), |row| {
             let name: String = row.get(0)?;
-            let value: Vec<u8> = row.get(1)?;
+            // Firefox stores `value` as TEXT while Chromium's `encrypted_value`
+            // is a BLOB; `as_bytes` takes either.
+            let value = row.get_ref(1)?.as_bytes()?.to_vec();
             Ok((name, value))
         })
         .map_err(|e| CookieError::Db(label.clone(), e.to_string()))?;
@@ -490,4 +660,118 @@ fn dpapi_decrypt(data: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(not(windows))]
 fn dpapi_decrypt(_data: &[u8]) -> Result<Vec<u8>, String> {
     Err("DPAPI is only available on Windows".to_string())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_db(name: &str, schema_sql: &str, rows: &[(&str, rusqlite::types::Value, &str, &str)]) -> PathBuf {
+        let dir = unique_private_dir().unwrap();
+        let path = dir.join(name);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(schema_sql).unwrap();
+        for (n, v, h, jar) in rows {
+            conn.execute("INSERT INTO t VALUES (?1, ?2, ?3, ?4)", rusqlite::params![n, v, h, jar]).unwrap();
+        }
+        path
+    }
+
+    fn firefox_def() -> &'static BrowserDef {
+        def("firefox").unwrap()
+    }
+
+    #[test]
+    fn reads_firefox_text_values_and_chromium_blobs() {
+        use rusqlite::types::Value;
+
+        // Firefox: `value` is TEXT. Every cookie on the site's hosts comes
+        // back — but only from the requested jar (container).
+        let ff = temp_db(
+            "cookies.sqlite",
+            "CREATE TABLE t (name TEXT, value TEXT, host TEXT, originAttributes TEXT); CREATE VIEW moz_cookies AS SELECT * FROM t;",
+            &[
+                ("sessionid", Value::Text("main".into()), ".instagram.com", ""),
+                ("csrftoken", Value::Text("csrf".into()), "www.instagram.com", ""),
+                ("sessionid", Value::Text("other-site".into()), ".example.com", ""),
+                ("unrelated", Value::Text("x".into()), ".instagram.com", ""),
+                ("sessionid", Value::Text("scraper".into()), ".instagram.com", "^userContextId=8"),
+                ("sessionid", Value::Text("partitioned".into()), ".instagram.com", "^partitionKey=(https,example.com)&userContextId=8"),
+            ],
+        );
+        let jar = FirefoxJar::Default.origin_attributes();
+        let mut rows = read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(&jar)).unwrap();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("csrftoken".to_string(), b"csrf".to_vec()),
+                ("sessionid".to_string(), b"main".to_vec()),
+                ("unrelated".to_string(), b"x".to_vec()),
+            ]
+        );
+        let jar = FirefoxJar::Container(8).origin_attributes();
+        let rows = read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(&jar)).unwrap();
+        assert_eq!(rows, vec![("sessionid".to_string(), b"scraper".to_vec())]);
+
+        // Chromium: `encrypted_value` is a BLOB, and no jar column.
+        let ch = temp_db(
+            "Cookies",
+            "CREATE TABLE t (name TEXT, encrypted_value BLOB, host_key TEXT, unused TEXT); CREATE VIEW cookies AS SELECT * FROM t;",
+            &[("auth_token", Value::Blob(vec![1, 2, 3]), ".x.com", "")],
+        );
+        let rows = read_db(firefox_def(), &ch, &CHROMIUM_SCHEMA, &X, None).unwrap();
+        assert_eq!(rows, vec![("auth_token".to_string(), vec![1, 2, 3])]);
+
+        for db in [ff, ch] {
+            let _ = fs::remove_dir_all(db.parent().unwrap());
+        }
+    }
+
+    #[test]
+    fn lists_public_containers_with_builtin_names_translated() {
+        let json = serde_json::json!({
+            "version": 5,
+            "identities": [
+                { "userContextId": 1, "public": true, "l10nId": "user-context-personal" },
+                { "userContextId": 3, "public": true, "l10nID": "userContextBanking.label", "name": "" },
+                { "userContextId": 4, "public": true, "name": "ショッピング" },
+                { "userContextId": 5, "public": false, "name": "userContextIdInternal.thumbnail" },
+                { "userContextId": 8, "public": true, "name": "Twitter Sub Account" },
+            ]
+        });
+        let names: Vec<(u32, String)> = parse_containers(&json).into_iter().map(|c| (c.id, c.name)).collect();
+        assert_eq!(
+            names,
+            vec![
+                (1, "Personal".to_string()),
+                (3, "Banking".to_string()),
+                (4, "ショッピング".to_string()),
+                (8, "Twitter Sub Account".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn container_ids_route_to_firefox_jars() {
+        assert!(matches!(import("firefox:abc", &INSTAGRAM), Err(CookieError::Unknown(_))));
+        assert!(matches!(import("chrome:1", &INSTAGRAM), Err(CookieError::Unknown(_))));
+        assert_eq!(FirefoxJar::Container(8).origin_attributes(), "^userContextId=8");
+    }
+
+    #[test]
+    fn assembles_a_session_only_around_the_primary_cookie() {
+        let found: HashMap<String, String> = [("mid", "m"), ("csrftoken", "c"), ("sessionid", "s"), ("datr", "d")]
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let session = assemble(&INSTAGRAM, firefox_def(), found).unwrap();
+        assert_eq!(session.as_cookie_string(), "sessionid=s; csrftoken=c; datr=d; mid=m");
+        assert_eq!(session.spec_hits(&INSTAGRAM), 2);
+        assert!(!session.is_complete(&INSTAGRAM), "ds_user_id is missing");
+        assert!(session.user_agent.contains("Firefox"));
+
+        let no_primary: HashMap<String, String> =
+            [("csrftoken".to_string(), "c".to_string())].into_iter().collect();
+        assert!(assemble(&INSTAGRAM, firefox_def(), no_primary).is_none());
+    }
 }

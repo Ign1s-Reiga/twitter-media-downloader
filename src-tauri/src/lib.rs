@@ -79,12 +79,13 @@ enum Scraper {
 }
 
 impl Scraper {
-    fn new(platform: Platform, session: Option<&str>) -> Result<Self, String> {
+    /// `user_agent` is the browser a session was imported from, if any.
+    fn new(platform: Platform, session: Option<&str>, user_agent: Option<&str>) -> Result<Self, String> {
         Ok(match platform {
             Platform::X => Self::X(TwitterScraper::new(session).map_err(|e| e.to_string())?),
-            Platform::Instagram => {
-                Self::Instagram(InstagramScraper::new(session).map_err(|e| e.to_string())?)
-            }
+            Platform::Instagram => Self::Instagram(
+                InstagramScraper::new(session, user_agent).map_err(|e| e.to_string())?,
+            ),
         })
     }
 
@@ -167,7 +168,7 @@ async fn fetch_user_media(
     // Browser import wins; otherwise a manually pasted token; otherwise guest.
     // Cookie import does blocking file/SQLite/DPAPI work — keep it off the async
     // runtime thread.
-    let session = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+    let (session, user_agent) = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
         Some(id) => {
             let id = id.to_string();
             let site = platform.cookie_site();
@@ -175,12 +176,12 @@ async fn fetch_user_media(
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
-            Some(imported.as_cookie_string())
+            (Some(imported.as_cookie_string()), Some(imported.user_agent))
         }
-        None => session_token.filter(|s| !s.trim().is_empty()),
+        None => (session_token.filter(|s| !s.trim().is_empty()), None),
     };
 
-    let mut scraper = Scraper::new(platform, session.as_deref())?;
+    let mut scraper = Scraper::new(platform, session.as_deref(), user_agent)?;
     let user_id = scraper.get_user_id(&username).await?;
 
     let mut items: Vec<MediaItem> = Vec::new();

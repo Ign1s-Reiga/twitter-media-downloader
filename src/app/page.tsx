@@ -4,6 +4,7 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group';
 import { CheckIcon, DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, ListChecksIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon, XIcon } from 'lucide-react';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
 import { useEffect, useRef, useState, KeyboardEvent } from 'react';
@@ -30,11 +31,15 @@ interface MediaResponse {
 interface BrowserInfo {
   id: string;
   label: string;
+  /** Firefox Multi-Account Containers; empty for other browsers. */
+  containers: { id: number; name: string }[];
 }
 
 // Account source is either 'guest', 'manual', or a detected browser id.
 const GUEST = 'guest';
 const MANUAL = 'manual';
+// Container choice meaning "the browser's default, container-less jar".
+const NO_CONTAINER = 'default';
 
 function TaskStatusIcon({ status }: { status: DownloadStatus }) {
   switch (status) {
@@ -59,6 +64,8 @@ export default function Page() {
   const [sessionTokens, setSessionTokens] = useState<Record<Platform, string>>({ x: '', instagram: '' });
   const [accountSource, setAccountSource] = useState(GUEST);
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
+  // Chosen Firefox container per browser id (NO_CONTAINER when unset).
+  const [containers, setContainers] = useState<Record<string, string>>({});
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
@@ -70,6 +77,12 @@ export default function Page() {
   const info = platformInfo(platform);
   const sessionToken = sessionTokens[platform];
   const setSessionToken = (value: string) => setSessionTokens((prev) => ({ ...prev, [platform]: value }));
+
+  const selectedBrowser = browsers.find((b) => b.id === accountSource);
+  const selectedContainer = containers[accountSource] ?? NO_CONTAINER;
+  // The backend addresses a container as `firefox:<id>`.
+  const browserImportId =
+    selectedContainer === NO_CONTAINER ? accountSource : `${accountSource}:${selectedContainer}`;
 
   const scrollResultsToTop = () => {
     resultsRef.current
@@ -102,7 +115,7 @@ export default function Page() {
         platform,
         accountUrl,
         filters,
-        browser: usingBrowser ? accountSource : null,
+        browser: usingBrowser ? browserImportId : null,
         sessionToken: accountSource === MANUAL ? sessionToken.trim() || null : null,
       });
       setItems(res.items);
@@ -237,6 +250,30 @@ export default function Page() {
                       Import the logged-in account from a browser, or paste a token manually. {info.guestNote}
                     </FieldDescription>
                   </Field>
+                  {selectedBrowser && selectedBrowser.containers.length > 0 && (
+                    <Field className="col-span-2">
+                      <FieldLabel htmlFor="browser-container">Container</FieldLabel>
+                      <Select
+                        value={selectedContainer}
+                        onValueChange={(v) => setContainers((prev) => ({ ...prev, [accountSource]: v }))}
+                      >
+                        <SelectTrigger id="browser-container">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_CONTAINER}>No container (default)</SelectItem>
+                          {selectedBrowser.containers.map((c) => (
+                            <SelectItem key={c.id} value={String(c.id)}>
+                              {c.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FieldDescription>
+                        Which {selectedBrowser.label} Multi-Account Container&apos;s login to use. Each container has its own cookies, so a separate scraping account can live in one.
+                      </FieldDescription>
+                    </Field>
+                  )}
                   <Field>
                     <FieldLabel htmlFor="media-filter">Media content filter</FieldLabel>
                     <ToggleGroup

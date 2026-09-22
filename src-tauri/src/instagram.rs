@@ -22,6 +22,7 @@ use crate::media::{MediaItem, MediaPage};
 /// Public app id shipped in the Instagram web bundle (not a secret).
 const APP_ID: &str = "936619743392459";
 
+/// Default User-Agent; a browser-imported session brings its own instead.
 const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const API_BASE: &str = "https://www.instagram.com/api/v1";
@@ -44,10 +45,10 @@ pub enum ScrapeError {
     UserNotFound,
     #[error("this account is private — follow it from the account you're scraping with")]
     Private,
-    #[error("Instagram requires a login — pick a browser you're logged into, or paste a sessionid cookie")]
-    LoginRequired,
-    #[error("Instagram is rate-limiting this account — wait a few minutes and try again")]
-    RateLimited,
+    #[error("Instagram requires a login — pick a browser you're logged into, or paste a sessionid cookie ({0})")]
+    LoginRequired(String),
+    #[error("Instagram is rate-limiting this account — wait a few minutes and try again ({0})")]
+    RateLimited(String),
     #[error("Instagram returned an error: {0}")]
     Api(String),
     #[error("could not parse Instagram's response (the API schema may have changed)")]
@@ -94,29 +95,47 @@ pub fn extract_username(input: &str) -> Result<String, ScrapeError> {
 }
 
 /// Parsed credentials for an authenticated session.
+///
+/// Instagram's anti-bot tier treats a `sessionid` that turns up without the
+/// device cookies issued alongside it (`mid`, `ig_did`, `datr`, …) as a
+/// hijacked session and answers with a "wait a few minutes" 429, so every
+/// cookie the caller gave us is carried, not just the login.
 struct Session {
-    sessionid: String,
-    /// CSRF cookie; sent back as `x-csrftoken` when we have it. GET endpoints
-    /// don't enforce it, so it's optional.
-    csrftoken: Option<String>,
-    ds_user_id: Option<String>,
+    /// All cookies, `sessionid` guaranteed present.
+    cookies: Vec<(String, String)>,
+    /// CSRF cookie, echoed as the `x-csrftoken` header. The web client sends
+    /// the pair on every request; GETs don't check it against a server-issued
+    /// value, so a random one stands in when the caller didn't supply it.
+    csrftoken: String,
 }
 
 impl Session {
     fn cookie_header(&self) -> String {
-        let mut parts = vec![format!("sessionid={}", self.sessionid)];
-        if let Some(c) = &self.csrftoken {
-            parts.push(format!("csrftoken={c}"));
-        }
-        if let Some(u) = &self.ds_user_id {
-            parts.push(format!("ds_user_id={u}"));
-        }
-        parts.join("; ")
+        self.cookies
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    #[cfg(test)]
+    fn sessionid(&self) -> &str {
+        &self.cookies.iter().find(|(k, _)| k == "sessionid").unwrap().1
     }
 }
 
-/// Turn the UI "Session Token" field into a `Session`. Accepts either a bare
-/// `sessionid` value or a full `key=value; key=value` cookie string.
+fn random_csrftoken() -> String {
+    use rand::Rng;
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..32)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .collect()
+}
+
+/// Turn the UI "Session Token" field (or a browser import) into a `Session`.
+/// Accepts either a bare `sessionid` value or a full `key=value; key=value`
+/// cookie string, all of which is kept.
 fn parse_session(token: &str) -> Option<Session> {
     let token = token.trim();
     if token.is_empty() {
@@ -125,36 +144,29 @@ fn parse_session(token: &str) -> Option<Session> {
 
     // A bare sessionid looks like `12345678%3Aabcdef...` — it contains `%3A`
     // (or a literal `:`), never `=`. A cookie string always has `=`.
-    if !token.contains('=') {
-        return Some(Session {
-            sessionid: token.to_string(),
-            csrftoken: None,
-            ds_user_id: None,
-        });
-    }
+    let mut cookies: Vec<(String, String)> = if token.contains('=') {
+        token
+            .split(';')
+            .filter_map(|pair| {
+                let (key, val) = pair.split_once('=')?;
+                let (key, val) = (key.trim(), val.trim());
+                (!key.is_empty() && !val.is_empty()).then(|| (key.to_string(), val.to_string()))
+            })
+            .collect()
+    } else {
+        vec![("sessionid".to_string(), token.to_string())]
+    };
 
-    let mut sessionid = None;
-    let mut csrftoken = None;
-    let mut ds_user_id = None;
-    for pair in token.split(';') {
-        let mut kv = pair.splitn(2, '=');
-        let key = kv.next().unwrap_or("").trim();
-        let val = kv.next().unwrap_or("").trim();
-        if val.is_empty() {
-            continue;
+    cookies.iter().find(|(k, _)| k == "sessionid")?;
+    let csrftoken = match cookies.iter().find(|(k, _)| k == "csrftoken") {
+        Some((_, v)) => v.clone(),
+        None => {
+            let random = random_csrftoken();
+            cookies.push(("csrftoken".to_string(), random.clone()));
+            random
         }
-        match key {
-            "sessionid" => sessionid = Some(val.to_string()),
-            "csrftoken" => csrftoken = Some(val.to_string()),
-            "ds_user_id" => ds_user_id = Some(val.to_string()),
-            _ => {}
-        }
-    }
-    Some(Session {
-        sessionid: sessionid?,
-        csrftoken,
-        ds_user_id,
-    })
+    };
+    Some(Session { cookies, csrftoken })
 }
 
 pub struct InstagramScraper {
@@ -163,12 +175,13 @@ pub struct InstagramScraper {
 }
 
 impl InstagramScraper {
-    pub fn new(session_token: Option<&str>) -> Result<Self, ScrapeError> {
+    /// `user_agent` should be the browser the session came from, when known.
+    pub fn new(session_token: Option<&str>, user_agent: Option<&str>) -> Result<Self, ScrapeError> {
         // Don't follow redirects: an unauthenticated request gets bounced to
         // the login page with a 200 HTML body, which would be indistinguishable
         // from a real answer. A 3xx is a clean "login required" signal instead.
         let http = reqwest::Client::builder()
-            .user_agent(UA)
+            .user_agent(user_agent.unwrap_or(UA))
             .gzip(true)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
@@ -178,22 +191,26 @@ impl InstagramScraper {
         })
     }
 
-    /// Apply the headers the web client sends on every `/api/v1` request.
+    /// Apply the headers the web client's XHRs carry on every `/api/v1`
+    /// request; Instagram's anti-bot tier answers requests missing them with
+    /// a "wait a few minutes" 429 even for a valid session.
     fn headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let req = req
             .header("accept", "*/*")
+            .header("accept-language", "en-US,en;q=0.9")
             .header("x-ig-app-id", APP_ID)
+            .header("x-asbd-id", "129477")
+            .header("x-ig-www-claim", "0")
             .header("x-requested-with", "XMLHttpRequest")
+            .header("sec-fetch-site", "same-origin")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-dest", "empty")
             .header("origin", "https://www.instagram.com")
             .header("referer", "https://www.instagram.com/");
         match &self.session {
-            Some(s) => {
-                let req = req.header("cookie", s.cookie_header());
-                match &s.csrftoken {
-                    Some(c) => req.header("x-csrftoken", c),
-                    None => req,
-                }
-            }
+            Some(s) => req
+                .header("cookie", s.cookie_header())
+                .header("x-csrftoken", &s.csrftoken),
             None => req,
         }
     }
@@ -202,7 +219,12 @@ impl InstagramScraper {
         let resp = self.headers(self.http.get(url)).send().await?;
         let status = resp.status();
         if status.is_redirection() {
-            return Err(ScrapeError::LoginRequired);
+            let to = resp
+                .headers()
+                .get("location")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("?");
+            return Err(ScrapeError::LoginRequired(format!("redirected to {to}")));
         }
         let text = resp.text().await?;
         let body: Value = match serde_json::from_str(&text) {
@@ -224,10 +246,16 @@ impl InstagramScraper {
         Err(self.classify_error(status, &msg))
     }
 
-    /// Map a failed response to the most specific error we can name.
+    /// Map a failed response to the most specific error we can name. Every
+    /// variant carries Instagram's own status/message for diagnosis.
     fn classify_error(&self, status: reqwest::StatusCode, message: &str) -> ScrapeError {
         let lower = message.to_ascii_lowercase();
         let code = status.as_u16();
+        let detail = if message.is_empty() {
+            format!("HTTP {code}")
+        } else {
+            format!("HTTP {code}: {message}")
+        };
         let rate_limited = code == 429 || lower.contains("please wait a few minutes");
         let login_wall = matches!(code, 401 | 403)
             || lower.contains("login_required")
@@ -238,16 +266,12 @@ impl InstagramScraper {
         // lookups, a "rate limit" 429 that's really a login wall — either way
         // the fix is to log in, so say so instead of "wait a few minutes".
         if login_wall || (rate_limited && self.session.is_none()) {
-            return ScrapeError::LoginRequired;
+            return ScrapeError::LoginRequired(detail);
         }
         if rate_limited {
-            return ScrapeError::RateLimited;
+            return ScrapeError::RateLimited(detail);
         }
-        if message.is_empty() {
-            ScrapeError::Api(format!("HTTP {code}"))
-        } else {
-            ScrapeError::Api(format!("HTTP {code}: {message}"))
-        }
+        ScrapeError::Api(detail)
     }
 
     /// Resolve a username to its numeric user id. Errors early on a private
@@ -469,14 +493,15 @@ mod tests {
     #[test]
     fn parses_bare_and_cookie_string_tokens() {
         let bare = parse_session("123%3Aabc").unwrap();
-        assert_eq!(bare.sessionid, "123%3Aabc");
-        assert!(bare.csrftoken.is_none());
+        assert_eq!(bare.sessionid(), "123%3Aabc");
+        assert_eq!(bare.csrftoken.len(), 32, "a random csrftoken stands in");
+        assert!(bare.cookie_header().starts_with("sessionid=123%3Aabc; csrftoken="));
 
-        let full = parse_session("csrftoken=tok; sessionid=123%3Aabc; ds_user_id=123; other=x").unwrap();
-        assert_eq!(full.sessionid, "123%3Aabc");
-        assert_eq!(full.csrftoken.as_deref(), Some("tok"));
-        assert_eq!(full.ds_user_id.as_deref(), Some("123"));
-        assert_eq!(full.cookie_header(), "sessionid=123%3Aabc; csrftoken=tok; ds_user_id=123");
+        // A full cookie string is carried whole, device cookies included.
+        let full = parse_session("csrftoken=tok; sessionid=123%3Aabc; ds_user_id=123; mid=m; =bad; empty=").unwrap();
+        assert_eq!(full.sessionid(), "123%3Aabc");
+        assert_eq!(full.csrftoken, "tok");
+        assert_eq!(full.cookie_header(), "csrftoken=tok; sessionid=123%3Aabc; ds_user_id=123; mid=m");
 
         assert!(parse_session("").is_none());
         assert!(parse_session("csrftoken=tok").is_none(), "no sessionid → no session");
