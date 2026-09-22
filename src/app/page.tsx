@@ -9,6 +9,7 @@ import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
 import { useEffect, useRef, useState, KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -26,6 +27,12 @@ import { useDownloads, type DownloadStatus } from '@/components/download-provide
 interface MediaResponse {
   items: MediaItem[];
   next_cursor: string | null;
+}
+
+/** Backend progress while it pauses between pages of a fetch. */
+interface FetchProgress {
+  items: number;
+  waiting_secs: number;
 }
 
 interface BrowserInfo {
@@ -68,6 +75,7 @@ export default function Page() {
   const [containers, setContainers] = useState<Record<string, string>>({});
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<FetchProgress | null>(null);
   const [searched, setSearched] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -105,6 +113,14 @@ export default function Page() {
       .catch(() => setBrowsers([]));
   }, []);
 
+  // The backend pauses between pages; show that it's waiting, not stuck.
+  useEffect(() => {
+    const unlisten = listen<FetchProgress>('fetch-progress', (e) => setProgress(e.payload));
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
   const retrieve = async () => {
     if (loading) return;
     if (!accountUrl.trim()) {
@@ -113,6 +129,7 @@ export default function Page() {
     }
 
     setLoading(true);
+    setProgress(null);
     setSearched(true);
     setSelectMode(false);
     setSelected(new Set());
@@ -138,6 +155,7 @@ export default function Page() {
       toast.error(typeof err === 'string' ? err : 'Failed to retrieve media.');
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   };
 
@@ -352,10 +370,18 @@ export default function Page() {
         </Card>
         <ScrollArea ref={resultsRef} className="grow h-0 pr-2">
           {loading ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
-              {[...Array(12)].map((_, i) => (
-                <Skeleton key={i} className="aspect-square rounded-lg" />
-              ))}
+            <div className="space-y-4">
+              <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-live="polite">
+                <Spinner />
+                {progress
+                  ? `Found ${progress.items} so far — pausing ${Math.round(progress.waiting_secs)}s before the next page…`
+                  : 'Fetching the first page…'}
+              </p>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
+                {[...Array(12)].map((_, i) => (
+                  <Skeleton key={i} className="aspect-square rounded-lg" />
+                ))}
+              </div>
             </div>
           ) : items.length > 0 ? (
             <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">

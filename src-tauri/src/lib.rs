@@ -16,6 +16,10 @@ const PAGE_SIZE: u32 = 20;
 const DEFAULT_MAX_ITEMS: usize = 100;
 /// Safety cap on page requests regardless of `max_items`.
 const MAX_PAGES: usize = 20;
+/// Pause between page requests, drawn uniformly from this range so the timing
+/// isn't mechanical. The sites' own clients fetch a page per scroll; firing
+/// pages back-to-back is what gets a session throttled.
+const PAGE_DELAY_SECS: std::ops::RangeInclusive<f64> = 5.0..=15.0;
 
 /// Browser-like UA used when fetching media from a platform's CDN, which may
 /// reject requests (notably video.twimg.com) that don't look like a browser.
@@ -134,6 +138,23 @@ pub struct MediaResponse {
     next_cursor: Option<String>,
 }
 
+/// Emitted as `fetch-progress` while `fetch_user_media` waits between pages,
+/// so the UI can show that a multi-minute fetch is alive.
+#[derive(Clone, Serialize)]
+struct FetchProgress {
+    /// Items collected so far.
+    items: usize,
+    /// How long we're about to wait before the next page.
+    waiting_secs: f64,
+}
+
+/// A random pause length from `PAGE_DELAY_SECS`. Kept out of the async fn so
+/// the (non-`Send`) thread RNG never lives across an `.await`.
+fn page_delay_secs() -> f64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(PAGE_DELAY_SECS)
+}
+
 /// List the browsers installed on this machine that we can import cookies from.
 #[tauri::command]
 fn list_browsers() -> Vec<BrowserInfo> {
@@ -153,6 +174,7 @@ fn list_browsers() -> Vec<BrowserInfo> {
 /// * `max_items` — soft cap on items to return (defaults to 100).
 #[tauri::command]
 async fn fetch_user_media(
+    app: tauri::AppHandle,
     platform: Option<String>,
     account_url: String,
     filters: Option<Vec<String>>,
@@ -188,7 +210,16 @@ async fn fetch_user_media(
     let mut cursor: Option<String> = None;
     let mut next_cursor: Option<String> = None;
 
-    for _ in 0..MAX_PAGES {
+    for page_no in 0..MAX_PAGES {
+        // Space the pages out like a person scrolling would; the first one is
+        // immediate.
+        if page_no > 0 {
+            use tauri::Emitter;
+            let waiting_secs = page_delay_secs();
+            let _ = app.emit("fetch-progress", FetchProgress { items: items.len(), waiting_secs });
+            tokio::time::sleep(std::time::Duration::from_secs_f64(waiting_secs)).await;
+        }
+
         let page = scraper
             .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE, &wants)
             .await?;
@@ -467,7 +498,14 @@ pub fn run() {
 }
 #[cfg(test)]
 mod tests {
-    use super::{cdn_referer, proxy_media};
+    use super::{cdn_referer, page_delay_secs, proxy_media, PAGE_DELAY_SECS};
+
+    #[test]
+    fn page_delay_stays_inside_its_range() {
+        for _ in 0..1000 {
+            assert!(PAGE_DELAY_SECS.contains(&page_delay_secs()));
+        }
+    }
 
     fn proxy_request(method: &str, target: &str) -> tauri::http::Request<Vec<u8>> {
         tauri::http::Request::builder()
