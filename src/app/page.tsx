@@ -27,6 +27,8 @@ import { useDownloads, type DownloadStatus } from '@/components/download-provide
 interface MediaResponse {
   items: MediaItem[];
   next_cursor: string | null;
+  /** Set when a later page failed and `items` is only what came before it. */
+  warning: string | null;
 }
 
 /** Backend progress while it pauses between pages of a fetch. */
@@ -147,6 +149,10 @@ export default function Page() {
       reset(); // new results arrived: clear finished task history (keeps any in-flight)
       if (res.items.length === 0) {
         toast.info('No media found for that account with the current filters.');
+      } else if (res.warning) {
+        toast.warning(`Stopped early with ${res.items.length} media item${res.items.length === 1 ? '' : 's'}.`, {
+          description: res.warning,
+        });
       } else {
         toast.success(`Found ${res.items.length} media item${res.items.length === 1 ? '' : 's'}.`);
       }

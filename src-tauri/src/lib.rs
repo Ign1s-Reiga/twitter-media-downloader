@@ -136,6 +136,9 @@ pub struct MediaResponse {
     items: Vec<MediaItem>,
     /// Cursor for a follow-up "load more" call, if the timeline has more.
     next_cursor: Option<String>,
+    /// Why the list is incomplete, when a later page failed after some
+    /// items had already been collected.
+    warning: Option<String>,
 }
 
 /// Emitted as `fetch-progress` while `fetch_user_media` waits between pages,
@@ -220,9 +223,19 @@ async fn fetch_user_media(
             tokio::time::sleep(std::time::Duration::from_secs_f64(waiting_secs)).await;
         }
 
-        let page = scraper
+        let page = match scraper
             .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE, &wants)
-            .await?;
+            .await
+        {
+            Ok(page) => page,
+            // A later page failing (rate limit, dropped connection…) shouldn't
+            // throw away minutes of pages already fetched: return those, say
+            // why the list is short, and keep the cursor of the page we missed.
+            Err(e) if !items.is_empty() => {
+                return Ok(MediaResponse { items, next_cursor: cursor, warning: Some(e) });
+            }
+            Err(e) => return Err(e),
+        };
 
         let page_cursor = page.next_cursor.clone();
         for item in page.items {
@@ -251,7 +264,7 @@ async fn fetch_user_media(
         }
     }
 
-    Ok(MediaResponse { items, next_cursor })
+    Ok(MediaResponse { items, next_cursor, warning: None })
 }
 
 /// Download a single media URL into the OS Downloads folder. Returns the saved
