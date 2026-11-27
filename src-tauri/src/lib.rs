@@ -210,6 +210,7 @@ async fn fetch_user_media(
     let user_id = scraper.get_user_id(&username).await?;
 
     let mut items: Vec<MediaItem> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut cursor: Option<String> = None;
     let mut next_cursor: Option<String> = None;
 
@@ -239,7 +240,9 @@ async fn fetch_user_media(
 
         let page_cursor = page.next_cursor.clone();
         for item in page.items {
-            if wants.accepts(&item.media_type) {
+            // A post can be listed by more than one timeline (X serves photos
+            // and videos separately), so keep the first sighting only.
+            if wants.accepts(&item.media_type) && seen.insert(item.id.clone()) {
                 items.push(item);
             }
         }
