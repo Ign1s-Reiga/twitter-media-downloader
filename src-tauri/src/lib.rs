@@ -320,27 +320,48 @@ async fn save_frame(
     write_file(dest, bytes).await
 }
 
-/// Where to save a file: the user-specified folder when given (creating it if
-/// needed), else the OS Downloads dir (which always exists) — never clobbering
-/// an existing file.
+/// Names of the files already in the download folder, so the UI can badge
+/// media that was downloaded before. A missing/unreadable folder is just empty.
+#[tauri::command]
+async fn list_downloaded(app: tauri::AppHandle, dir: Option<String>) -> Result<Vec<String>, String> {
+    let base = dest_dir(&app, dir.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read_dir(&base)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The folder downloads go to: the user-specified one when given, else the OS
+/// Downloads dir.
+fn dest_dir(app: &tauri::AppHandle, dir: Option<&str>) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+
+    match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => Ok(std::path::PathBuf::from(d)),
+        None => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("couldn't locate the Downloads folder: {e}")),
+    }
+}
+
+/// Where to save a file: `dest_dir` (created if needed) — never clobbering an
+/// existing file.
 fn resolve_dest(
     app: &tauri::AppHandle,
     dir: Option<&str>,
     filename: &str,
 ) -> Result<std::path::PathBuf, String> {
-    use tauri::Manager;
-
-    let base = match dir.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => {
-            let p = std::path::PathBuf::from(d);
-            std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
-            p
-        }
-        None => app
-            .path()
-            .download_dir()
-            .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
-    };
+    let base = dest_dir(app, dir)?;
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     Ok(unique_path(&base, &sanitize_filename(filename)))
 }
 
@@ -491,7 +512,8 @@ pub fn run() {
             fetch_user_media,
             list_browsers,
             download_media,
-            save_frame
+            save_frame,
+            list_downloaded
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
