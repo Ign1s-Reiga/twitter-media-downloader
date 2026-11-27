@@ -35,9 +35,9 @@ const UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (
 const GRAPHQL_BASE: &str = "https://x.com/i/api/graphql";
 
 // --- GraphQL query IDs (rotate; see module note) -----------------------------
-const QID_USER_BY_SCREEN_NAME: &str = "681MIj51w00Aj6dY0GXnHw";
-const QID_USER_PHOTO_TIMELINE: &str = "-7Kl-CfOGgXpmvSvNxuPpA";
-const QID_USER_VIDEO_TIMELINE: &str = "8FjnVm2ZmIymF6l1Tw2fBQ";
+const QID_USER_BY_SCREEN_NAME: &str = "AMIBMjtxEEATh4z8V9GtRg";
+const QID_USER_PHOTO_TIMELINE: &str = "zk9sfrhiW8gNjQUP-hwung";
+const QID_USER_VIDEO_TIMELINE: &str = "1UmMb8X-BFHS98GG6DyRsQ";
 
 /// The two timelines behind a profile's Media tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
