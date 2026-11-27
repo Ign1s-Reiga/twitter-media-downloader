@@ -94,13 +94,19 @@ enum FirefoxJar {
 }
 
 impl FirefoxJar {
-    /// The exact `originAttributes` value of first-party cookies in this jar.
-    /// (Partitioned third-party cookies carry extra attributes and are
-    /// deliberately left out.)
-    fn origin_attributes(self) -> String {
+    /// SQL condition on the `originAttributes` column `col` selecting this
+    /// jar's first-party cookies, plus its bound parameter if it has one.
+    /// The default jar is "no container, not partitioned" rather than an empty
+    /// value: first-party isolation and the like add attributes of their own
+    /// (`^firstPartyDomain=x.com`) to cookies that still belong to it.
+    /// (Partitioned third-party cookies are deliberately left out.)
+    fn sql_filter(self, col: &str) -> (String, Option<String>) {
         match self {
-            Self::Default => String::new(),
-            Self::Container(id) => format!("^userContextId={id}"),
+            Self::Default => (
+                format!("{col} NOT LIKE '%userContextId=%' AND {col} NOT LIKE '%partitionKey=%'"),
+                None,
+            ),
+            Self::Container(id) => (format!("{col} = ?"), Some(format!("^userContextId={id}"))),
         }
     }
 }
@@ -114,7 +120,9 @@ pub struct SiteCookies {
     /// Cookies a fully usable session also has (CSRF tokens etc.) — used to
     /// prefer one browser profile over another, not to limit what's read.
     pub extras: &'static [&'static str],
-    /// SQL `LIKE` patterns matched against the cookie's host.
+    /// Domains whose cookies belong to the site; a cookie host matches as the
+    /// domain itself or a subdomain of it (never a mere suffix: `netflix.com`
+    /// is not `x.com`).
     pub hosts: &'static [&'static str],
 }
 
@@ -128,14 +136,14 @@ pub const X: SiteCookies = SiteCookies {
     label: "X/Twitter",
     primary: "auth_token",
     extras: &["ct0"],
-    hosts: &["%x.com", "%twitter.com"],
+    hosts: &["x.com", "twitter.com"],
 };
 
 pub const INSTAGRAM: SiteCookies = SiteCookies {
     label: "Instagram",
     primary: "sessionid",
     extras: &["csrftoken", "ds_user_id"],
-    hosts: &["%instagram.com"],
+    hosts: &["instagram.com"],
 };
 
 /// Credentials lifted from a browser, ready to hand to a scraper.
@@ -255,13 +263,14 @@ fn import_chromium(
         if !db.is_file() {
             continue;
         }
-        let rows = read_db(d, &db, &CHROMIUM_SCHEMA, site, None)?;
+        let (rows, version) = read_db(d, &db, &CHROMIUM_SCHEMA, site, None)?;
+        let hash_prefixed = version.is_some_and(|v| v >= HASH_PREFIX_DB_VERSION);
 
         // Keep the cookies paired per profile — mixing them across profiles
         // would marry one account's login to another account's CSRF value.
         let mut found = HashMap::new();
         for (name, blob) in rows {
-            let val = match decrypt_chromium_value(d, &blob, &key) {
+            let val = match decrypt_chromium_value(d, &blob, &key, hash_prefixed) {
                 Ok(v) if !v.is_empty() => v,
                 Ok(_) => continue,
                 // One undecryptable row (e.g. a v20 app-bound value) shouldn't
@@ -335,7 +344,27 @@ fn chromium_master_key(d: &BrowserDef, root: &Path) -> Result<Vec<u8>, CookieErr
     dpapi_decrypt(&key).map_err(|_| CookieError::Decrypt(d.label.to_string()))
 }
 
-fn decrypt_chromium_value(d: &BrowserDef, enc: &[u8], key: &[u8]) -> Result<String, CookieError> {
+/// Cookie DB schema version from which Chromium (130+) prepends the SHA-256
+/// of the cookie's host to the value before encrypting it.
+const HASH_PREFIX_DB_VERSION: i64 = 24;
+
+/// Decrypt one cookie value. `hash_prefixed` says the DB is new enough that
+/// the plaintext starts with a 32-byte host hash, which is not part of the value.
+fn decrypt_chromium_value(
+    d: &BrowserDef,
+    enc: &[u8],
+    key: &[u8],
+    hash_prefixed: bool,
+) -> Result<String, CookieError> {
+    let plain = decrypt_chromium_blob(d, enc, key)?;
+    let value = match plain.get(32..) {
+        Some(rest) if hash_prefixed => rest,
+        _ => &plain[..],
+    };
+    Ok(String::from_utf8_lossy(value).into_owned())
+}
+
+fn decrypt_chromium_blob(d: &BrowserDef, enc: &[u8], key: &[u8]) -> Result<Vec<u8>, CookieError> {
     use aes_gcm::aead::{generic_array::GenericArray, Aead};
     use aes_gcm::{Aes256Gcm, KeyInit};
 
@@ -354,14 +383,12 @@ fn decrypt_chromium_value(d: &BrowserDef, enc: &[u8], key: &[u8]) -> Result<Stri
         }
         let cipher = Aes256Gcm::new(GenericArray::from_slice(key));
         let nonce = GenericArray::from_slice(&enc[3..15]);
-        let plain = cipher
+        return cipher
             .decrypt(nonce, &enc[15..])
-            .map_err(|_| CookieError::Decrypt(d.label.to_string()))?;
-        return Ok(String::from_utf8_lossy(&plain).into_owned());
+            .map_err(|_| CookieError::Decrypt(d.label.to_string()));
     }
     // Legacy: whole value is DPAPI-encrypted.
-    let plain = dpapi_decrypt(enc).map_err(|_| CookieError::Decrypt(d.label.to_string()))?;
-    Ok(String::from_utf8_lossy(&plain).into_owned())
+    dpapi_decrypt(enc).map_err(|_| CookieError::Decrypt(d.label.to_string()))
 }
 
 // --- Firefox ----------------------------------------------------------------
@@ -372,14 +399,12 @@ fn import_firefox(
     site: &SiteCookies,
     jar: FirefoxJar,
 ) -> Result<ImportedSession, CookieError> {
-    let origin_attributes = jar.origin_attributes();
-
     for profile in firefox_profiles(root) {
         let db = profile.join("cookies.sqlite");
         if !db.is_file() {
             continue;
         }
-        let rows = read_db(d, &db, &FIREFOX_SCHEMA, site, Some(&origin_attributes))?;
+        let (rows, _) = read_db(d, &db, &FIREFOX_SCHEMA, site, Some(jar))?;
         let found: HashMap<String, String> = rows
             .into_iter()
             .map(|(name, blob)| (name, String::from_utf8_lossy(&blob).into_owned()))
@@ -503,14 +528,15 @@ const FIREFOX_SCHEMA: CookieSchema = CookieSchema {
 /// Copy the (possibly browser-locked) DB to a temp file and select every
 /// cookie on the site's hosts — within one jar, when the schema has jars and
 /// `jar` names it — returning `(name, value-bytes)` rows. Firefox `value` comes
-/// back as text bytes; Chromium `encrypted_value` as the raw blob.
+/// back as text bytes; Chromium `encrypted_value` as the raw blob. Also returns
+/// the DB's schema version from its `meta` table (Chromium; `None` without one).
 fn read_db(
     d: &BrowserDef,
     db: &Path,
     schema: &CookieSchema,
     site: &SiteCookies,
-    jar: Option<&str>,
-) -> Result<Vec<(String, Vec<u8>)>, CookieError> {
+    jar: Option<FirefoxJar>,
+) -> Result<(Vec<(String, Vec<u8>)>, Option<i64>), CookieError> {
     use rusqlite::{params_from_iter, Connection, OpenFlags};
 
     // Hosts and the jar are bound as parameters; only the static schema
@@ -518,17 +544,22 @@ fn read_db(
     let host_marks = site
         .hosts
         .iter()
-        .map(|_| format!("{} LIKE ?", schema.host_col))
+        .map(|_| format!("{0} = ? OR {0} LIKE ?", schema.host_col))
         .collect::<Vec<_>>()
         .join(" OR ");
     let mut query = format!(
         "SELECT name, {} FROM {} WHERE ({host_marks})",
         schema.value_col, schema.table
     );
-    let mut params: Vec<&str> = site.hosts.to_vec();
+    let mut params: Vec<String> = site
+        .hosts
+        .iter()
+        .flat_map(|h| [h.to_string(), format!("%.{h}")])
+        .collect();
     if let (Some(col), Some(jar)) = (schema.jar_col, jar) {
-        query.push_str(&format!(" AND {col} = ?"));
-        params.push(jar);
+        let (condition, param) = jar.sql_filter(col);
+        query.push_str(&format!(" AND {condition}"));
+        params.extend(param);
     }
 
     let label = d.label.to_string();
@@ -557,7 +588,21 @@ fn read_db(
     for r in rows {
         out.push(r.map_err(|e| CookieError::Db(label.clone(), e.to_string()))?);
     }
-    Ok(out)
+
+    // Stored as an integer or as text depending on the Chromium build.
+    let version = conn
+        .query_row("SELECT value FROM meta WHERE key = 'version'", [], |row| {
+            Ok(match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Integer(i) => Some(i),
+                rusqlite::types::ValueRef::Text(t) => {
+                    std::str::from_utf8(t).ok().and_then(|t| t.trim().parse().ok())
+                }
+                _ => None,
+            })
+        })
+        .ok()
+        .flatten();
+    Ok((out, version))
 }
 
 /// A private copy of a (possibly browser-locked) cookie DB and its
@@ -693,34 +738,45 @@ mod tests {
                 ("sessionid", Value::Text("main".into()), ".instagram.com", ""),
                 ("csrftoken", Value::Text("csrf".into()), "www.instagram.com", ""),
                 ("sessionid", Value::Text("other-site".into()), ".example.com", ""),
+                // Ends in the site's domain without being it or a subdomain.
+                ("sessionid", Value::Text("lookalike".into()), "notinstagram.com", ""),
+                // First-party isolation tags default-jar cookies too.
+                ("ds_user_id", Value::Text("fpi".into()), ".instagram.com", "^firstPartyDomain=instagram.com"),
                 ("unrelated", Value::Text("x".into()), ".instagram.com", ""),
                 ("sessionid", Value::Text("scraper".into()), ".instagram.com", "^userContextId=8"),
                 ("sessionid", Value::Text("partitioned".into()), ".instagram.com", "^partitionKey=(https,example.com)&userContextId=8"),
             ],
         );
-        let jar = FirefoxJar::Default.origin_attributes();
-        let mut rows = read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(&jar)).unwrap();
+        let (mut rows, version) =
+            read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(FirefoxJar::Default)).unwrap();
         rows.sort();
+        assert_eq!(version, None, "no meta table");
         assert_eq!(
             rows,
             vec![
                 ("csrftoken".to_string(), b"csrf".to_vec()),
+                ("ds_user_id".to_string(), b"fpi".to_vec()),
                 ("sessionid".to_string(), b"main".to_vec()),
                 ("unrelated".to_string(), b"x".to_vec()),
             ]
         );
-        let jar = FirefoxJar::Container(8).origin_attributes();
-        let rows = read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(&jar)).unwrap();
+        let (rows, _) =
+            read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(FirefoxJar::Container(8))).unwrap();
         assert_eq!(rows, vec![("sessionid".to_string(), b"scraper".to_vec())]);
 
         // Chromium: `encrypted_value` is a BLOB, and no jar column.
         let ch = temp_db(
             "Cookies",
-            "CREATE TABLE t (name TEXT, encrypted_value BLOB, host_key TEXT, unused TEXT); CREATE VIEW cookies AS SELECT * FROM t;",
-            &[("auth_token", Value::Blob(vec![1, 2, 3]), ".x.com", "")],
+            "CREATE TABLE t (name TEXT, encrypted_value BLOB, host_key TEXT, unused TEXT); CREATE VIEW cookies AS SELECT * FROM t;
+             CREATE TABLE meta (key LONGVARCHAR, value LONGVARCHAR); INSERT INTO meta VALUES ('version', 24);",
+            &[
+                ("auth_token", Value::Blob(vec![1, 2, 3]), ".x.com", ""),
+                ("auth_token", Value::Blob(vec![9]), ".netflix.com", ""),
+            ],
         );
-        let rows = read_db(firefox_def(), &ch, &CHROMIUM_SCHEMA, &X, None).unwrap();
+        let (rows, version) = read_db(firefox_def(), &ch, &CHROMIUM_SCHEMA, &X, None).unwrap();
         assert_eq!(rows, vec![("auth_token".to_string(), vec![1, 2, 3])]);
+        assert_eq!(version, Some(24));
 
         for db in [ff, ch] {
             let _ = fs::remove_dir_all(db.parent().unwrap());
@@ -755,7 +811,33 @@ mod tests {
     fn container_ids_route_to_firefox_jars() {
         assert!(matches!(import("firefox:abc", &INSTAGRAM), Err(CookieError::Unknown(_))));
         assert!(matches!(import("chrome:1", &INSTAGRAM), Err(CookieError::Unknown(_))));
-        assert_eq!(FirefoxJar::Container(8).origin_attributes(), "^userContextId=8");
+        assert_eq!(
+            FirefoxJar::Container(8).sql_filter("c"),
+            ("c = ?".to_string(), Some("^userContextId=8".to_string()))
+        );
+    }
+
+    #[test]
+    fn strips_the_host_hash_from_newer_chromium_values() {
+        use aes_gcm::aead::{generic_array::GenericArray, Aead};
+        use aes_gcm::{Aes256Gcm, KeyInit};
+
+        let key = [7u8; 32];
+        let nonce = [1u8; 12];
+        let mut plain = vec![0xAB; 32]; // stands in for SHA-256(host)
+        plain.extend_from_slice(b"secret");
+        let mut enc = b"v10".to_vec();
+        enc.extend_from_slice(&nonce);
+        enc.extend(
+            Aes256Gcm::new(GenericArray::from_slice(&key))
+                .encrypt(GenericArray::from_slice(&nonce), &plain[..])
+                .unwrap(),
+        );
+
+        let d = def("chrome").unwrap();
+        assert_eq!(decrypt_chromium_value(d, &enc, &key, true).unwrap(), "secret");
+        // An older DB has no prefix, so nothing may be cut off.
+        assert_eq!(decrypt_chromium_value(d, &enc, &key, false).unwrap().len(), 32 + 6);
     }
 
     #[test]

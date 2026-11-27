@@ -55,12 +55,19 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   // What's already in the download folder. Rescanned when the folder changes
   // and when the window regains focus (files may be moved/deleted outside the app).
   const [downloaded, setDownloaded] = useState<ReadonlySet<string>>(new Set());
+  // Bumped per finished download, so a scan can tell one landed while it ran.
+  const finishedRef = useRef(0);
   useEffect(() => {
     const scan = () => {
+      const finished = finishedRef.current;
       invoke<string[]>('list_downloaded', { dir: downloadDir })
         .then((names) => {
           // Drop a stale answer if the folder changed while scanning.
-          if (dirRef.current === downloadDir) setDownloaded(new Set(names));
+          if (dirRef.current !== downloadDir) return;
+          // A download finished mid-scan: this listing may predate its file and
+          // would wipe its badge, so list again instead of applying it.
+          if (finishedRef.current !== finished) return scan();
+          setDownloaded(new Set(names));
         })
         .catch(() => {});
     };
@@ -113,6 +120,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               if (!firstPath) firstPath = path;
               done += 1;
               setStatus(e.id, 'completed');
+              finishedRef.current += 1;
               if (dirRef.current === dir) setDownloaded((prev) => new Set(prev).add(e.label));
             } catch (err) {
               failed += 1;
