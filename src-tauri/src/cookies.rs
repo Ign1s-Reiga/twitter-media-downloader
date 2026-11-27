@@ -95,19 +95,22 @@ enum FirefoxJar {
 
 impl FirefoxJar {
     /// SQL condition on the `originAttributes` column `col` selecting this
-    /// jar's first-party cookies, plus its bound parameter if it has one.
-    /// The default jar is "no container, not partitioned" rather than an empty
-    /// value: first-party isolation and the like add attributes of their own
-    /// (`^firstPartyDomain=x.com`) to cookies that still belong to it.
-    /// (Partitioned third-party cookies are deliberately left out.)
-    fn sql_filter(self, col: &str) -> (String, Option<String>) {
-        match self {
-            Self::Default => (
-                format!("{col} NOT LIKE '%userContextId=%' AND {col} NOT LIKE '%partitionKey=%'"),
-                None,
+    /// jar's first-party cookies. A jar is told by its `userContextId`
+    /// attribute (absent for the default one) rather than by the whole value:
+    /// first-party isolation and the like add attributes of their own
+    /// (`^firstPartyDomain=x.com&userContextId=8`) to cookies that still
+    /// belong to it. (Partitioned third-party cookies are deliberately left out.)
+    fn sql_filter(self, col: &str) -> String {
+        let jar = match self {
+            Self::Default => format!("{col} NOT LIKE '%userContextId=%'"),
+            // The id is a number, so it is safe to inline. Each pattern ends
+            // the attribute, so container 8 never matches container 80.
+            Self::Container(id) => format!(
+                "({col} = '^userContextId={id}' OR {col} LIKE '^userContextId={id}&%' \
+                 OR {col} LIKE '%&userContextId={id}' OR {col} LIKE '%&userContextId={id}&%')"
             ),
-            Self::Container(id) => (format!("{col} = ?"), Some(format!("^userContextId={id}"))),
-        }
+        };
+        format!("{jar} AND {col} NOT LIKE '%partitionKey=%'")
     }
 }
 
@@ -539,8 +542,8 @@ fn read_db(
 ) -> Result<(Vec<(String, Vec<u8>)>, Option<i64>), CookieError> {
     use rusqlite::{params_from_iter, Connection, OpenFlags};
 
-    // Hosts and the jar are bound as parameters; only the static schema
-    // identifiers are interpolated.
+    // Hosts are bound as parameters; only the static schema identifiers and
+    // the jar condition (static text plus a numeric id) are interpolated.
     let host_marks = site
         .hosts
         .iter()
@@ -551,15 +554,13 @@ fn read_db(
         "SELECT name, {} FROM {} WHERE ({host_marks})",
         schema.value_col, schema.table
     );
-    let mut params: Vec<String> = site
+    let params: Vec<String> = site
         .hosts
         .iter()
         .flat_map(|h| [h.to_string(), format!("%.{h}")])
         .collect();
     if let (Some(col), Some(jar)) = (schema.jar_col, jar) {
-        let (condition, param) = jar.sql_filter(col);
-        query.push_str(&format!(" AND {condition}"));
-        params.extend(param);
+        query.push_str(&format!(" AND {}", jar.sql_filter(col)));
     }
 
     let label = d.label.to_string();
@@ -745,6 +746,10 @@ mod tests {
                 ("unrelated", Value::Text("x".into()), ".instagram.com", ""),
                 ("sessionid", Value::Text("scraper".into()), ".instagram.com", "^userContextId=8"),
                 ("sessionid", Value::Text("partitioned".into()), ".instagram.com", "^partitionKey=(https,example.com)&userContextId=8"),
+                // First-party isolation inside a container, and a container
+                // whose id merely starts with the same digit.
+                ("csrftoken", Value::Text("fpi8".into()), ".instagram.com", "^firstPartyDomain=instagram.com&userContextId=8"),
+                ("sessionid", Value::Text("container80".into()), ".instagram.com", "^userContextId=80"),
             ],
         );
         let (mut rows, version) =
@@ -760,9 +765,16 @@ mod tests {
                 ("unrelated".to_string(), b"x".to_vec()),
             ]
         );
-        let (rows, _) =
+        let (mut rows, _) =
             read_db(firefox_def(), &ff, &FIREFOX_SCHEMA, &INSTAGRAM, Some(FirefoxJar::Container(8))).unwrap();
-        assert_eq!(rows, vec![("sessionid".to_string(), b"scraper".to_vec())]);
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                ("csrftoken".to_string(), b"fpi8".to_vec()),
+                ("sessionid".to_string(), b"scraper".to_vec()),
+            ]
+        );
 
         // Chromium: `encrypted_value` is a BLOB, and no jar column.
         let ch = temp_db(
@@ -811,10 +823,7 @@ mod tests {
     fn container_ids_route_to_firefox_jars() {
         assert!(matches!(import("firefox:abc", &INSTAGRAM), Err(CookieError::Unknown(_))));
         assert!(matches!(import("chrome:1", &INSTAGRAM), Err(CookieError::Unknown(_))));
-        assert_eq!(
-            FirefoxJar::Container(8).sql_filter("c"),
-            ("c = ?".to_string(), Some("^userContextId=8".to_string()))
-        );
+        assert!(FirefoxJar::Container(8).sql_filter("c").contains("c = '^userContextId=8'"));
     }
 
     #[test]
