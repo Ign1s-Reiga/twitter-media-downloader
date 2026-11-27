@@ -36,3 +36,11 @@ export const PLATFORMS: PlatformInfo[] = [
 export function platformInfo(id: Platform): PlatformInfo {
   return PLATFORMS.find((p) => p.id === id) ?? PLATFORMS[0];
 }
+
+/** The platform a pasted profile URL belongs to, or null for a bare handle. */
+export function platformFromInput(input: string): Platform | null {
+  const s = input.trim().toLowerCase();
+  if (/(^|[/.])instagram\.com\//.test(s)) return 'instagram';
+  if (/(^|[/.])(x|twitter)\.com\//.test(s)) return 'x';
+  return null;
+}

@@ -17,7 +17,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { cn } from '@/lib/utils';
-import { MediaItem, frameFilename } from '@/lib/media';
+import { MediaItem, frameFilename, mediaFilename } from '@/lib/media';
 import { useDownloads } from '@/components/download-provider';
 
 /**
@@ -55,7 +55,8 @@ export function MediaCard({
   const isGif = item.media_type === 'animated_gif';
   const isPlayable = isVideo || isGif;
   const kind = isGif ? 'GIF' : isVideo ? 'Video' : 'Image';
-  const { enqueue, downloadDir } = useDownloads();
+  const { enqueue, downloadDir, downloaded } = useDownloads();
+  const isDownloaded = downloaded.has(mediaFilename(item));
   const [downloading, setDownloading] = useState(false);
   const [capturing, setCapturing] = useState(false);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -142,6 +143,13 @@ export function MediaCard({
         <span className="absolute left-2 top-2 flex items-center gap-1 rounded-md bg-black/65 px-1.5 py-0.5 text-xs font-medium text-white backdrop-blur-sm">
           {isGif ? <FilmIcon className="size-3" /> : <PlayIcon className="size-3" />}
           {kind}
+        </span>
+      )}
+
+      {isDownloaded && (
+        <span className="absolute bottom-2 left-2 flex items-center gap-1 rounded-md bg-primary px-1.5 py-0.5 text-xs font-medium text-primary-foreground shadow-sm">
+          <CheckIcon className="size-3" />
+          Downloaded
         </span>
       )}
     </>

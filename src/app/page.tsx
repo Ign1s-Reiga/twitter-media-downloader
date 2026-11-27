@@ -4,10 +4,12 @@ import { Field, FieldDescription, FieldGroup, FieldLabel } from '@/components/ui
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group';
 import { CheckIcon, DownloadIcon, FolderIcon, GlobeIcon, ImageIcon, KeyRoundIcon, ListChecksIcon, MaximizeIcon, MinimizeIcon, SearchIcon, UserRoundIcon, VideoIcon, XIcon } from 'lucide-react';
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Kbd } from '@/components/ui/kbd';
 import ToggleThemeButton from '@/components/toggle-theme-button';
 import { useEffect, useRef, useState, KeyboardEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open as openDialog } from '@tauri-apps/plugin-dialog';
 import { toast } from 'sonner';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
@@ -17,7 +19,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Skeleton } from '@/components/ui/skeleton';
 import { MediaCard } from '@/components/media-card';
 import { MediaItem } from '@/lib/media';
-import { PLATFORMS, platformInfo, type Platform } from '@/lib/platform';
+import { PLATFORMS, platformFromInput, platformInfo, type Platform } from '@/lib/platform';
 import { PLATFORM_ICONS } from '@/components/platform-icons';
 import { Spinner } from '@/components/ui/spinner';
 import { useDownloads, type DownloadStatus } from '@/components/download-provider';
@@ -27,14 +29,24 @@ interface MediaResponse {
   next_cursor: string | null;
 }
 
+/** Backend progress while it pauses between pages of a fetch. */
+interface FetchProgress {
+  items: number;
+  waiting_secs: number;
+}
+
 interface BrowserInfo {
   id: string;
   label: string;
+  /** Firefox Multi-Account Containers; empty for other browsers. */
+  containers: { id: number; name: string }[];
 }
 
 // Account source is either 'guest', 'manual', or a detected browser id.
 const GUEST = 'guest';
 const MANUAL = 'manual';
+// Container choice meaning "the browser's default, container-less jar".
+const NO_CONTAINER = 'default';
 
 function TaskStatusIcon({ status }: { status: DownloadStatus }) {
   switch (status) {
@@ -59,8 +71,11 @@ export default function Page() {
   const [sessionTokens, setSessionTokens] = useState<Record<Platform, string>>({ x: '', instagram: '' });
   const [accountSource, setAccountSource] = useState(GUEST);
   const [browsers, setBrowsers] = useState<BrowserInfo[]>([]);
+  // Chosen Firefox container per browser id (NO_CONTAINER when unset).
+  const [containers, setContainers] = useState<Record<string, string>>({});
   const [items, setItems] = useState<MediaItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [progress, setProgress] = useState<FetchProgress | null>(null);
   const [searched, setSearched] = useState(false);
   const [selectMode, setSelectMode] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -70,6 +85,20 @@ export default function Page() {
   const info = platformInfo(platform);
   const sessionToken = sessionTokens[platform];
   const setSessionToken = (value: string) => setSessionTokens((prev) => ({ ...prev, [platform]: value }));
+
+  const selectedBrowser = browsers.find((b) => b.id === accountSource);
+  const selectedContainer = containers[accountSource] ?? NO_CONTAINER;
+  // The backend addresses a container as `firefox:<id>`.
+  const browserImportId =
+    selectedContainer === NO_CONTAINER ? accountSource : `${accountSource}:${selectedContainer}`;
+
+  // A pasted profile URL says which site it's for — flip the toggle rather
+  // than making the user do it (and then rejecting the URL if they forget).
+  const onAccountUrlChange = (value: string) => {
+    setAccountUrl(value);
+    const detected = platformFromInput(value);
+    if (detected) setPlatform(detected);
+  };
 
   const scrollResultsToTop = () => {
     resultsRef.current
@@ -84,6 +113,14 @@ export default function Page() {
       .catch(() => setBrowsers([]));
   }, []);
 
+  // The backend pauses between pages; show that it's waiting, not stuck.
+  useEffect(() => {
+    const unlisten = listen<FetchProgress>('fetch-progress', (e) => setProgress(e.payload));
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
+
   const retrieve = async () => {
     if (loading) return;
     if (!accountUrl.trim()) {
@@ -92,6 +129,7 @@ export default function Page() {
     }
 
     setLoading(true);
+    setProgress(null);
     setSearched(true);
     setSelectMode(false);
     setSelected(new Set());
@@ -102,7 +140,7 @@ export default function Page() {
         platform,
         accountUrl,
         filters,
-        browser: usingBrowser ? accountSource : null,
+        browser: usingBrowser ? browserImportId : null,
         sessionToken: accountSource === MANUAL ? sessionToken.trim() || null : null,
       });
       setItems(res.items);
@@ -117,6 +155,7 @@ export default function Page() {
       toast.error(typeof err === 'string' ? err : 'Failed to retrieve media.');
     } finally {
       setLoading(false);
+      setProgress(null);
     }
   };
 
@@ -194,7 +233,7 @@ export default function Page() {
                     <InputGroupInput
                       placeholder={info.placeholder}
                       value={accountUrl}
-                      onChange={(e) => setAccountUrl(e.target.value)}
+                      onChange={(e) => onAccountUrlChange(e.target.value)}
                       onKeyDown={onAccountKeyDown}
                       disabled={loading}
                     />
@@ -237,6 +276,30 @@ export default function Page() {
                       Import the logged-in account from a browser, or paste a token manually. {info.guestNote}
                     </FieldDescription>
                   </Field>
+                  {selectedBrowser && selectedBrowser.containers.length > 0 && (
+                    <Field className="col-span-2">
+                      <FieldLabel htmlFor="browser-container">Container</FieldLabel>
+                      <Select
+                        value={selectedContainer}
+                        onValueChange={(v) => setContainers((prev) => ({ ...prev, [accountSource]: v }))}
+                      >
+                        <SelectTrigger id="browser-container">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value={NO_CONTAINER}>No container (default)</SelectItem>
+                          {selectedBrowser.containers.map((c) => (
+                            <SelectItem key={c.id} value={String(c.id)}>
+                              {c.name}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FieldDescription>
+                        Which {selectedBrowser.label} Multi-Account Container&apos;s login to use. Each container has its own cookies, so a separate scraping account can live in one.
+                      </FieldDescription>
+                    </Field>
+                  )}
                   <Field>
                     <FieldLabel htmlFor="media-filter">Media content filter</FieldLabel>
                     <ToggleGroup
@@ -307,10 +370,18 @@ export default function Page() {
         </Card>
         <ScrollArea ref={resultsRef} className="grow h-0 pr-2">
           {loading ? (
-            <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
-              {[...Array(12)].map((_, i) => (
-                <Skeleton key={i} className="aspect-square rounded-lg" />
-              ))}
+            <div className="space-y-4">
+              <p className="flex items-center gap-2 text-sm text-muted-foreground" aria-live="polite">
+                <Spinner />
+                {progress
+                  ? `Found ${progress.items} so far — pausing ${Math.round(progress.waiting_secs)}s before the next page…`
+                  : 'Fetching the first page…'}
+              </p>
+              <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">
+                {[...Array(12)].map((_, i) => (
+                  <Skeleton key={i} className="aspect-square rounded-lg" />
+                ))}
+              </div>
             </div>
           ) : items.length > 0 ? (
             <div className="grid grid-cols-[repeat(auto-fill,minmax(200px,1fr))] gap-4">

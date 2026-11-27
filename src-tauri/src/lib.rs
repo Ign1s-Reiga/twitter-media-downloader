@@ -16,6 +16,10 @@ const PAGE_SIZE: u32 = 20;
 const DEFAULT_MAX_ITEMS: usize = 100;
 /// Safety cap on page requests regardless of `max_items`.
 const MAX_PAGES: usize = 20;
+/// Pause between page requests, drawn uniformly from this range so the timing
+/// isn't mechanical. The sites' own clients fetch a page per scroll; firing
+/// pages back-to-back is what gets a session throttled.
+const PAGE_DELAY_SECS: std::ops::RangeInclusive<f64> = 5.0..=15.0;
 
 /// Browser-like UA used when fetching media from a platform's CDN, which may
 /// reject requests (notably video.twimg.com) that don't look like a browser.
@@ -79,12 +83,13 @@ enum Scraper {
 }
 
 impl Scraper {
-    fn new(platform: Platform, session: Option<&str>) -> Result<Self, String> {
+    /// `user_agent` is the browser a session was imported from, if any.
+    fn new(platform: Platform, session: Option<&str>, user_agent: Option<&str>) -> Result<Self, String> {
         Ok(match platform {
             Platform::X => Self::X(TwitterScraper::new(session).map_err(|e| e.to_string())?),
-            Platform::Instagram => {
-                Self::Instagram(InstagramScraper::new(session).map_err(|e| e.to_string())?)
-            }
+            Platform::Instagram => Self::Instagram(
+                InstagramScraper::new(session, user_agent).map_err(|e| e.to_string())?,
+            ),
         })
     }
 
@@ -133,6 +138,23 @@ pub struct MediaResponse {
     next_cursor: Option<String>,
 }
 
+/// Emitted as `fetch-progress` while `fetch_user_media` waits between pages,
+/// so the UI can show that a multi-minute fetch is alive.
+#[derive(Clone, Serialize)]
+struct FetchProgress {
+    /// Items collected so far.
+    items: usize,
+    /// How long we're about to wait before the next page.
+    waiting_secs: f64,
+}
+
+/// A random pause length from `PAGE_DELAY_SECS`. Kept out of the async fn so
+/// the (non-`Send`) thread RNG never lives across an `.await`.
+fn page_delay_secs() -> f64 {
+    use rand::Rng;
+    rand::thread_rng().gen_range(PAGE_DELAY_SECS)
+}
+
 /// List the browsers installed on this machine that we can import cookies from.
 #[tauri::command]
 fn list_browsers() -> Vec<BrowserInfo> {
@@ -152,6 +174,7 @@ fn list_browsers() -> Vec<BrowserInfo> {
 /// * `max_items` — soft cap on items to return (defaults to 100).
 #[tauri::command]
 async fn fetch_user_media(
+    app: tauri::AppHandle,
     platform: Option<String>,
     account_url: String,
     filters: Option<Vec<String>>,
@@ -167,7 +190,7 @@ async fn fetch_user_media(
     // Browser import wins; otherwise a manually pasted token; otherwise guest.
     // Cookie import does blocking file/SQLite/DPAPI work — keep it off the async
     // runtime thread.
-    let session = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
+    let (session, user_agent) = match browser.as_deref().map(str::trim).filter(|b| !b.is_empty()) {
         Some(id) => {
             let id = id.to_string();
             let site = platform.cookie_site();
@@ -175,19 +198,28 @@ async fn fetch_user_media(
                 .await
                 .map_err(|e| e.to_string())?
                 .map_err(|e| e.to_string())?;
-            Some(imported.as_cookie_string())
+            (Some(imported.as_cookie_string()), Some(imported.user_agent))
         }
-        None => session_token.filter(|s| !s.trim().is_empty()),
+        None => (session_token.filter(|s| !s.trim().is_empty()), None),
     };
 
-    let mut scraper = Scraper::new(platform, session.as_deref())?;
+    let mut scraper = Scraper::new(platform, session.as_deref(), user_agent)?;
     let user_id = scraper.get_user_id(&username).await?;
 
     let mut items: Vec<MediaItem> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut next_cursor: Option<String> = None;
 
-    for _ in 0..MAX_PAGES {
+    for page_no in 0..MAX_PAGES {
+        // Space the pages out like a person scrolling would; the first one is
+        // immediate.
+        if page_no > 0 {
+            use tauri::Emitter;
+            let waiting_secs = page_delay_secs();
+            let _ = app.emit("fetch-progress", FetchProgress { items: items.len(), waiting_secs });
+            tokio::time::sleep(std::time::Duration::from_secs_f64(waiting_secs)).await;
+        }
+
         let page = scraper
             .fetch_media_page(&user_id, cursor.as_deref(), PAGE_SIZE, &wants)
             .await?;
@@ -288,27 +320,48 @@ async fn save_frame(
     write_file(dest, bytes).await
 }
 
-/// Where to save a file: the user-specified folder when given (creating it if
-/// needed), else the OS Downloads dir (which always exists) — never clobbering
-/// an existing file.
+/// Names of the files already in the download folder, so the UI can badge
+/// media that was downloaded before. A missing/unreadable folder is just empty.
+#[tauri::command]
+async fn list_downloaded(app: tauri::AppHandle, dir: Option<String>) -> Result<Vec<String>, String> {
+    let base = dest_dir(&app, dir.as_deref())?;
+    tauri::async_runtime::spawn_blocking(move || {
+        std::fs::read_dir(&base)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// The folder downloads go to: the user-specified one when given, else the OS
+/// Downloads dir.
+fn dest_dir(app: &tauri::AppHandle, dir: Option<&str>) -> Result<std::path::PathBuf, String> {
+    use tauri::Manager;
+
+    match dir.map(str::trim).filter(|d| !d.is_empty()) {
+        Some(d) => Ok(std::path::PathBuf::from(d)),
+        None => app
+            .path()
+            .download_dir()
+            .map_err(|e| format!("couldn't locate the Downloads folder: {e}")),
+    }
+}
+
+/// Where to save a file: `dest_dir` (created if needed) — never clobbering an
+/// existing file.
 fn resolve_dest(
     app: &tauri::AppHandle,
     dir: Option<&str>,
     filename: &str,
 ) -> Result<std::path::PathBuf, String> {
-    use tauri::Manager;
-
-    let base = match dir.map(str::trim).filter(|d| !d.is_empty()) {
-        Some(d) => {
-            let p = std::path::PathBuf::from(d);
-            std::fs::create_dir_all(&p).map_err(|e| e.to_string())?;
-            p
-        }
-        None => app
-            .path()
-            .download_dir()
-            .map_err(|e| format!("couldn't locate the Downloads folder: {e}"))?,
-    };
+    let base = dest_dir(app, dir)?;
+    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
     Ok(unique_path(&base, &sanitize_filename(filename)))
 }
 
@@ -459,14 +512,22 @@ pub fn run() {
             fetch_user_media,
             list_browsers,
             download_media,
-            save_frame
+            save_frame,
+            list_downloaded
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
 #[cfg(test)]
 mod tests {
-    use super::{cdn_referer, proxy_media};
+    use super::{cdn_referer, page_delay_secs, proxy_media, PAGE_DELAY_SECS};
+
+    #[test]
+    fn page_delay_stays_inside_its_range() {
+        for _ in 0..1000 {
+            assert!(PAGE_DELAY_SECS.contains(&page_delay_secs()));
+        }
+    }
 
     fn proxy_request(method: &str, target: &str) -> tauri::http::Request<Vec<u8>> {
         tauri::http::Request::builder()

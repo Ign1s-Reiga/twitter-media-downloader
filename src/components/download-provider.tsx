@@ -1,6 +1,6 @@
 'use client';
 
-import { createContext, useCallback, useContext, useRef, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { revealItemInDir } from '@tauri-apps/plugin-opener';
 import { toast } from 'sonner';
@@ -25,6 +25,8 @@ interface DownloadContextValue {
   /** Folder downloads are saved to; null means the OS Downloads folder. */
   downloadDir: string | null;
   setDownloadDir: (dir: string | null) => void;
+  /** Filenames already present in the download folder. */
+  downloaded: ReadonlySet<string>;
 }
 
 const DownloadContext = createContext<DownloadContextValue | null>(null);
@@ -49,6 +51,23 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
     dirRef.current = dir;
     setDownloadDirState(dir);
   }, []);
+
+  // What's already in the download folder. Rescanned when the folder changes
+  // and when the window regains focus (files may be moved/deleted outside the app).
+  const [downloaded, setDownloaded] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    const scan = () => {
+      invoke<string[]>('list_downloaded', { dir: downloadDir })
+        .then((names) => {
+          // Drop a stale answer if the folder changed while scanning.
+          if (dirRef.current === downloadDir) setDownloaded(new Set(names));
+        })
+        .catch(() => {});
+    };
+    scan();
+    window.addEventListener('focus', scan);
+    return () => window.removeEventListener('focus', scan);
+  }, [downloadDir]);
 
   const setStatus = useCallback((id: string, status: DownloadStatus) => {
     setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, status } : t)));
@@ -94,6 +113,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
               if (!firstPath) firstPath = path;
               done += 1;
               setStatus(e.id, 'completed');
+              if (dirRef.current === dir) setDownloaded((prev) => new Set(prev).add(e.label));
             } catch (err) {
               failed += 1;
               if (!firstError) firstError = typeof err === 'string' ? err : String(err);
@@ -121,7 +141,7 @@ export function DownloadProvider({ children }: { children: React.ReactNode }) {
   );
 
   return (
-    <DownloadContext.Provider value={{ tasks, enqueue, reset, downloadDir, setDownloadDir }}>
+    <DownloadContext.Provider value={{ tasks, enqueue, reset, downloadDir, setDownloadDir, downloaded }}>
       {children}
     </DownloadContext.Provider>
   );
