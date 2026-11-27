@@ -562,22 +562,24 @@ fn extract_media_from_tweet(tweet: &Value, out: &mut Vec<MediaItem>) {
         None => return,
     };
 
-    for m in media {
-        if let Some(item) = build_media_item(m, &tweet_id, &tweet_url) {
+    for (index, m) in media.iter().enumerate() {
+        if let Some(item) = build_media_item(m, index, &tweet_id, &tweet_url) {
             out.push(item);
         }
     }
 }
 
-fn build_media_item(m: &Value, tweet_id: &str, tweet_url: &str) -> Option<MediaItem> {
+/// `index` is the attachment's position in its tweet, used only to keep ids
+/// unique when X omits the media's own.
+fn build_media_item(m: &Value, index: usize, tweet_id: &str, tweet_url: &str) -> Option<MediaItem> {
     let media_type = m.get("type").and_then(Value::as_str)?.to_string();
     let thumb = m.get("media_url_https").and_then(Value::as_str)?.to_string();
     let id = m
         .get("media_key")
         .or_else(|| m.get("id_str"))
         .and_then(Value::as_str)
-        .unwrap_or(tweet_id)
-        .to_string();
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{tweet_id}_{index}"));
 
     let (width, height) = m
         .pointer("/original_info/width")

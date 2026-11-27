@@ -357,26 +357,28 @@ fn collect_post(post: &Value, out: &mut Vec<MediaItem>) {
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten();
-            for slide in slides {
-                if let Some(item) = build_media_item(slide, code, &post_url) {
+            for (index, slide) in slides.enumerate() {
+                if let Some(item) = build_media_item(slide, index, code, &post_url) {
                     out.push(item);
                 }
             }
         }
         _ => {
-            if let Some(item) = build_media_item(post, code, &post_url) {
+            if let Some(item) = build_media_item(post, 0, code, &post_url) {
                 out.push(item);
             }
         }
     }
 }
 
-fn build_media_item(m: &Value, post_id: &str, post_url: &str) -> Option<MediaItem> {
+/// `index` is the slide's position in its post, used only to keep ids unique
+/// when Instagram omits the media's own.
+fn build_media_item(m: &Value, index: usize, post_id: &str, post_url: &str) -> Option<MediaItem> {
     let id = m
         .get("pk")
         .and_then(value_as_string)
         .or_else(|| m.get("id").and_then(value_as_string))
-        .unwrap_or_else(|| post_id.to_string());
+        .unwrap_or_else(|| format!("{post_id}_{index}"));
 
     let is_video = match m.get("media_type").and_then(Value::as_u64) {
         Some(MEDIA_TYPE_VIDEO) => true,
